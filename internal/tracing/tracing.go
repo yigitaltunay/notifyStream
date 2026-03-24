@@ -53,7 +53,6 @@ func Setup(ctx context.Context, serviceName string) (func(context.Context) error
 	case "http":
 		expOpts = append(expOpts, otlptracehttp.WithInsecure())
 	case "https":
-		// TLS via system roots
 	default:
 		return nil, fmt.Errorf("tracing: OTLP endpoint URL scheme must be http or https, got %q", u.Scheme)
 	}

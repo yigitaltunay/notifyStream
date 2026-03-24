@@ -7,10 +7,18 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/yaltunay/notifystream/internal/amqp"
 	"github.com/yaltunay/notifystream/internal/db"
 	"github.com/yaltunay/notifystream/internal/domain"
+)
+
+const (
+	outboxBatchPerTick  = 25
+	scheduledPerTick    = 50
+	outboxClaimChunk   = 1
+	scheduledClaimChunk = 1
 )
 
 func StartOutboxRelay(ctx context.Context, store *db.Store, bus *amqp.Client, interval time.Duration) {
@@ -21,67 +29,50 @@ func StartOutboxRelay(ctx context.Context, store *db.Store, bus *amqp.Client, in
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			entries, err := store.ListOutboxPending(ctx, 25)
-			if err != nil {
-				slog.Warn("outbox list", "error", err)
-				continue
-			}
-			for _, e := range entries {
-				if err := processOutboxEntry(ctx, store, bus, e); err != nil {
-					slog.Warn("outbox publish", "error", err, "outbox_id", e.ID, "notification_id", e.NotificationID)
+			for range outboxBatchPerTick {
+				tx, err := store.Pool().Begin(ctx)
+				if err != nil {
+					slog.Warn("outbox begin", "error", err)
+					break
+				}
+				entries, err := store.ClaimOutboxBatch(ctx, tx, outboxClaimChunk)
+				if err != nil {
+					_ = tx.Rollback(ctx)
+					slog.Warn("outbox claim", "error", err)
+					break
+				}
+				if len(entries) == 0 {
+					_ = tx.Rollback(ctx)
+					break
+				}
+				if err := processOutboxEntry(ctx, tx, store, bus, entries[0]); err != nil {
+					_ = tx.Rollback(ctx)
+					slog.Warn("outbox publish", "error", err, "outbox_id", entries[0].ID, "notification_id", entries[0].NotificationID)
+					continue
+				}
+				if err := tx.Commit(ctx); err != nil {
+					slog.Warn("outbox commit", "error", err, "outbox_id", entries[0].ID)
 				}
 			}
 		}
 	}
 }
 
-func processOutboxEntry(ctx context.Context, store *db.Store, bus *amqp.Client, e db.OutboxEntry) error {
+func processOutboxEntry(ctx context.Context, tx pgx.Tx, store *db.Store, bus *amqp.Client, e db.OutboxEntry) error {
 	n, err := store.GetByID(ctx, e.NotificationID)
 	if err != nil {
 		return err
 	}
 	if n.Status != domain.StatusPending {
-		tx, err := store.Pool().Begin(ctx)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = tx.Rollback(ctx) }()
-		if err := store.MarkOutboxPublished(ctx, tx, e.ID); err != nil {
-			return err
-		}
-		return tx.Commit(ctx)
+		return store.MarkOutboxPublished(ctx, tx, e.ID)
 	}
 	if err := bus.PublishNotification(ctx, n); err != nil {
 		return err
 	}
-	const maxAttempts = 5
-	const backoff = 30 * time.Millisecond
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(backoff):
-			}
-		}
-		tx, err := store.Pool().Begin(ctx)
-		if err != nil {
-			continue
-		}
-		if err := store.MarkQueued(ctx, tx, e.NotificationID); err != nil {
-			_ = tx.Rollback(ctx)
-			continue
-		}
-		if err := store.MarkOutboxPublished(ctx, tx, e.ID); err != nil {
-			_ = tx.Rollback(ctx)
-			continue
-		}
-		if err := tx.Commit(ctx); err != nil {
-			continue
-		}
-		return nil
+	if err := store.MarkQueued(ctx, tx, e.NotificationID); err != nil {
+		return err
 	}
-	return fmt.Errorf("outbox finalize after publish: notification_id=%s", e.NotificationID)
+	return store.MarkOutboxPublished(ctx, tx, e.ID)
 }
 
 func StartScheduler(ctx context.Context, store *db.Store, bus *amqp.Client, interval time.Duration) {
@@ -92,21 +83,36 @@ func StartScheduler(ctx context.Context, store *db.Store, bus *amqp.Client, inte
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			ids, err := store.ListDueScheduled(ctx, 50)
-			if err != nil {
-				slog.Warn("scheduler list", "error", err)
-				continue
-			}
-			for _, id := range ids {
-				if err := processScheduled(ctx, store, bus, id); err != nil {
-					slog.Warn("scheduler publish", "error", err, "notification_id", id)
+			for range scheduledPerTick {
+				tx, err := store.Pool().Begin(ctx)
+				if err != nil {
+					slog.Warn("scheduler begin", "error", err)
+					break
+				}
+				ids, err := store.ClaimDueScheduled(ctx, tx, scheduledClaimChunk)
+				if err != nil {
+					_ = tx.Rollback(ctx)
+					slog.Warn("scheduler claim", "error", err)
+					break
+				}
+				if len(ids) == 0 {
+					_ = tx.Rollback(ctx)
+					break
+				}
+				if err := processScheduled(ctx, tx, store, bus, ids[0]); err != nil {
+					_ = tx.Rollback(ctx)
+					slog.Warn("scheduler publish", "error", err, "notification_id", ids[0])
+					continue
+				}
+				if err := tx.Commit(ctx); err != nil {
+					slog.Warn("scheduler commit", "error", err, "notification_id", ids[0])
 				}
 			}
 		}
 	}
 }
 
-func processScheduled(ctx context.Context, store *db.Store, bus *amqp.Client, id uuid.UUID) error {
+func processScheduled(ctx context.Context, tx pgx.Tx, store *db.Store, bus *amqp.Client, id uuid.UUID) error {
 	n, err := store.GetByID(ctx, id)
 	if err != nil {
 		return err
@@ -117,8 +123,8 @@ func processScheduled(ctx context.Context, store *db.Store, bus *amqp.Client, id
 	if err := bus.PublishNotification(ctx, n); err != nil {
 		return err
 	}
-	if err := store.MarkQueuedWithRetry(ctx, n.ID, 5, 30*time.Millisecond); err != nil {
-		return err
+	if err := store.MarkQueued(ctx, tx, id); err != nil {
+		return fmt.Errorf("mark queued after scheduled publish: %w", err)
 	}
 	return nil
 }

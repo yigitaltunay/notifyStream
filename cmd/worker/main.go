@@ -4,18 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
-	amqp091 "github.com/rabbitmq/amqp091-go"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	amqp091 "github.com/rabbitmq/amqp091-go"
 	"golang.org/x/sync/errgroup"
-	"golang.org/x/time/rate"
 
 	"github.com/google/uuid"
 
@@ -25,11 +26,87 @@ import (
 	"github.com/yaltunay/notifystream/internal/delivery"
 	"github.com/yaltunay/notifystream/internal/domain"
 	"github.com/yaltunay/notifystream/internal/metrics"
+	"github.com/yaltunay/notifystream/internal/ratelimit"
 	"github.com/yaltunay/notifystream/internal/tracing"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 const maxWebhookRetries = 5
+
+// pauseBeforeRequeue avoids a hot loop when Nack(requeue=true) redelivers immediately (rate limit, Redis, republish errors).
+func pauseBeforeRequeue(ctx context.Context, d amqp091.Delivery) {
+	rc := amqp.RetryCount(d.Headers)
+	ms := 100 + rc*80
+	if ms > 2500 {
+		ms = 2500
+	}
+	j := time.Duration(time.Now().UnixNano() % int64(60*time.Millisecond))
+	wait := time.Duration(ms)*time.Millisecond + j
+	select {
+	case <-ctx.Done():
+	case <-time.After(wait):
+	}
+}
+
+func revertSendingAndRequeue(ctx context.Context, store *db.Store, id uuid.UUID, cause error, d amqp091.Delivery) error {
+	pauseBeforeRequeue(ctx, d)
+	rctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	if err := store.ReleaseSendingToQueued(rctx, id); err != nil {
+		slog.Error("release sending to queued", "error", err, "notification_id", id)
+	}
+	slog.Warn("requeue after release sending", "notification_id", id, "cause", cause.Error(), "x_retry_count", amqp.RetryCount(d.Headers))
+	return fmt.Errorf("%w: %v", amqp.ErrRequeueDelivery, cause)
+}
+
+func markDeliveredWithRetry(ctx context.Context, store *db.Store, id uuid.UUID, mid *string) error {
+	const maxAttempts = 30
+	mdCtx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	var lastErr error
+	for i := 0; i < maxAttempts; i++ {
+		if err := mdCtx.Err(); err != nil {
+			return fmt.Errorf("mark delivered: %w (last=%v)", err, lastErr)
+		}
+		if err := store.MarkDelivered(mdCtx, id, mid); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		if i+1 == maxAttempts {
+			break
+		}
+		shift := i
+		if shift > 6 {
+			shift = 6
+		}
+		wait := time.Duration(50*(1<<shift)) * time.Millisecond
+		if wait > 2*time.Second {
+			wait = 2 * time.Second
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(wait):
+		}
+	}
+	return fmt.Errorf("mark delivered after %d attempts: %w", maxAttempts, lastErr)
+}
+
+func stuckSendingRecovery() time.Duration {
+	const def = 120
+	s := strings.TrimSpace(os.Getenv("STUCK_SENDING_RECOVERY_SECONDS"))
+	if s == "" {
+		return time.Duration(def) * time.Second
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil || v < 0 {
+		return time.Duration(def) * time.Second
+	}
+	if v == 0 {
+		return 0
+	}
+	return time.Duration(v) * time.Second
+}
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
@@ -79,19 +156,30 @@ func main() {
 
 	wh := delivery.NewWebhook(cfg.WebhookURL, otelhttp.NewTransport(http.DefaultTransport))
 
-	limiters := map[domain.Channel]*rate.Limiter{
-		domain.ChannelSMS:   rate.NewLimiter(rate.Limit(100), 100),
-		domain.ChannelEmail: rate.NewLimiter(rate.Limit(100), 100),
-		domain.ChannelPush:  rate.NewLimiter(rate.Limit(100), 100),
+	limWaiter, stopLim, err := ratelimit.NewChannelWaiter(cfg.RedisURL, 100, 100)
+	if err != nil {
+		slog.Error("rate limiter", "error", err)
+		os.Exit(1)
+	}
+	defer stopLim()
+	if cfg.RedisURL != "" {
+		slog.Info("delivery rate limit", "backend", "redis")
+	} else {
+		slog.Info("delivery rate limit", "backend", "memory_per_worker")
+	}
+
+	stuckRec := stuckSendingRecovery()
+	if stuckRec > 0 {
+		slog.Info("stale sending recovery", "after", stuckRec.String())
 	}
 
 	g, ctx := errgroup.WithContext(ctx)
 	for _, ch := range []domain.Channel{domain.ChannelSMS, domain.ChannelEmail, domain.ChannelPush} {
-		lim := limiters[ch]
+		ch := ch
 		g.Go(func() error {
 			slog.Info("consumer started", "channel", ch)
 			return bus.Consume(ctx, ch, func(c context.Context, d amqp091.Delivery) error {
-				return handleDelivery(c, store, bus, wh, lim, ch, d)
+				return handleDelivery(c, store, bus, wh, limWaiter, ch, d, stuckRec)
 			})
 		})
 	}
@@ -128,7 +216,7 @@ func enrichEnvelopeFromDelivery(env *amqp.Envelope, d amqp091.Delivery) {
 	env.CorrelationID = &s
 }
 
-func handleDelivery(ctx context.Context, store *db.Store, bus *amqp.Client, wh *delivery.Webhook, lim *rate.Limiter, ch domain.Channel, d amqp091.Delivery) error {
+func handleDelivery(ctx context.Context, store *db.Store, bus *amqp.Client, wh *delivery.Webhook, lim ratelimit.ChannelWaiter, ch domain.Channel, d amqp091.Delivery, stuckRecover time.Duration) error {
 	start := time.Now()
 	ctx = amqp.ExtractTraceCtx(ctx, d.Headers)
 	var env amqp.Envelope
@@ -148,6 +236,13 @@ func handleDelivery(ctx context.Context, store *db.Store, bus *amqp.Client, wh *
 		return err
 	}
 	log = log.With("notification_id", id.String())
+	log.Info("delivery received",
+		"routing_key", d.RoutingKey,
+		"consumer_channel", string(ch),
+		"delivery_tag", d.DeliveryTag,
+		"retry_count", amqp.RetryCount(d.Headers),
+		"message", string(d.Body),
+	)
 
 	n, err := store.GetByID(ctx, id)
 	if err != nil {
@@ -158,6 +253,7 @@ func handleDelivery(ctx context.Context, store *db.Store, bus *amqp.Client, wh *
 	if n.Status == domain.StatusCancelled || n.Status == domain.StatusDelivered {
 		return nil
 	}
+
 	if n.Status != domain.StatusPending && n.Status != domain.StatusQueued && n.Status != domain.StatusSending {
 		log.Info("skip consume; unexpected status", "status", n.Status)
 		return nil
@@ -175,6 +271,14 @@ func handleDelivery(ctx context.Context, store *db.Store, bus *amqp.Client, wh *
 		return berr
 	}
 
+	rlWait := time.Now()
+	if err := lim.Wait(ctx, ch); err != nil {
+		pauseBeforeRequeue(ctx, d)
+		slog.Warn("requeue after rate limit wait", "notification_id", id, "error", err, "x_retry_count", amqp.RetryCount(d.Headers))
+		return fmt.Errorf("%w: %v", amqp.ErrRequeueDelivery, err)
+	}
+	metrics.RateLimitWait.Observe(time.Since(rlWait).Seconds())
+
 	if err := store.MarkSending(ctx, id); err != nil {
 		n2, _ := store.GetByID(ctx, id)
 		if n2.Status == domain.StatusCancelled || n2.Status == domain.StatusDelivered {
@@ -184,12 +288,6 @@ func handleDelivery(ctx context.Context, store *db.Store, bus *amqp.Client, wh *
 		return nil
 	}
 
-	rlWait := time.Now()
-	if err := lim.Wait(ctx); err != nil {
-		return err
-	}
-	metrics.RateLimitWait.Observe(time.Since(rlWait).Seconds())
-
 	msgID, postErr := wh.Post(ctx, outEnv)
 	if postErr == nil {
 		metrics.DeliveryLatency.WithLabelValues(chLabel).Observe(time.Since(start).Seconds())
@@ -198,7 +296,8 @@ func handleDelivery(ctx context.Context, store *db.Store, bus *amqp.Client, wh *
 		if msgID != "" {
 			mid = &msgID
 		}
-		if err := store.MarkDelivered(ctx, id, mid); err != nil {
+		if err := markDeliveredWithRetry(ctx, store, id, mid); err != nil {
+			slog.Error("mark delivered failed after webhook 2xx (row left sending; fix DB or replay)", "error", err, "notification_id", id)
 			return err
 		}
 		emitStatus(ctx, bus, n, "delivered")
@@ -236,13 +335,13 @@ func handleDelivery(ctx context.Context, store *db.Store, bus *amqp.Client, wh *
 	backoff := retryBackoff(rc)
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return revertSendingAndRequeue(ctx, store, id, ctx.Err(), d)
 	case <-time.After(backoff):
 	}
 
 	h := cloneHeaders(d.Headers)
 	if err := bus.RepublishDelivery(ctx, d.RoutingKey, d.Body, d.Priority, h); err != nil {
-		return err
+		return revertSendingAndRequeue(ctx, store, id, err, d)
 	}
 	log.Info("delivery transient; republished", "detail", postErr.Error(), "next_retry", rc+1)
 	return nil

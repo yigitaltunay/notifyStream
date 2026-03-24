@@ -12,19 +12,20 @@ type OutboxEntry struct {
 	NotificationID uuid.UUID
 }
 
-func (s *Store) ListOutboxPending(ctx context.Context, limit int) ([]OutboxEntry, error) {
+func (s *Store) ClaimOutboxBatch(ctx context.Context, tx pgx.Tx, limit int) ([]OutboxEntry, error) {
 	if limit <= 0 {
 		limit = 20
 	}
 	if limit > 100 {
 		limit = 100
 	}
-	rows, err := s.pool.Query(ctx, `
+	rows, err := tx.Query(ctx, `
 		SELECT id, notification_id
 		FROM outbox
 		WHERE published_at IS NULL
 		ORDER BY id ASC
 		LIMIT $1
+		FOR UPDATE SKIP LOCKED
 	`, limit)
 	if err != nil {
 		return nil, err
@@ -48,14 +49,14 @@ func (s *Store) MarkOutboxPublished(ctx context.Context, tx pgx.Tx, id int64) er
 	return err
 }
 
-func (s *Store) ListDueScheduled(ctx context.Context, limit int) ([]uuid.UUID, error) {
+func (s *Store) ClaimDueScheduled(ctx context.Context, tx pgx.Tx, limit int) ([]uuid.UUID, error) {
 	if limit <= 0 {
 		limit = 50
 	}
 	if limit > 200 {
 		limit = 200
 	}
-	rows, err := s.pool.Query(ctx, `
+	rows, err := tx.Query(ctx, `
 		SELECT id
 		FROM notifications
 		WHERE status = 'pending'
@@ -63,6 +64,7 @@ func (s *Store) ListDueScheduled(ctx context.Context, limit int) ([]uuid.UUID, e
 		  AND scheduled_at <= now()
 		ORDER BY scheduled_at ASC, id ASC
 		LIMIT $1
+		FOR UPDATE SKIP LOCKED
 	`, limit)
 	if err != nil {
 		return nil, err

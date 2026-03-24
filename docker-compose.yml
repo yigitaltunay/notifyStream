@@ -35,7 +35,6 @@ services:
     env_file:
       - .env
     environment:
-      # Default when unset in .env so Jaeger shows notifystream-* services without extra steps
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT-http://jaeger:4318}
     ports:
       - "8080:8080"
@@ -72,6 +71,8 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+      redis:
+        condition: service_healthy
       jaeger:
         condition: service_started
       api:
@@ -90,6 +91,16 @@ services:
       - "4318:4318"
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
 volumes:
   postgres_data:

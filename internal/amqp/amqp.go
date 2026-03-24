@@ -3,6 +3,7 @@ package amqp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -22,6 +23,9 @@ const (
 	RoutingDLQ     = "notify.dlq"
 	HeaderRetry    = "x-retry-count"
 )
+
+// ErrRequeueDelivery tells the consumer to Nack with requeue after releasing DB locks (e.g. sending → queued).
+var ErrRequeueDelivery = errors.New("requeue amqp delivery")
 
 func RetryCount(headers amqp091.Table) int {
 	if headers == nil {
@@ -364,7 +368,8 @@ func (c *Client) Consume(ctx context.Context, ch domain.Channel, handler func(co
 				return fmt.Errorf("consumer channel closed")
 			}
 			if err := handler(ctx, d); err != nil {
-				_ = d.Nack(false, false)
+				requeue := errors.Is(err, ErrRequeueDelivery)
+				_ = d.Nack(false, requeue)
 				continue
 			}
 			if err := d.Ack(false); err != nil {

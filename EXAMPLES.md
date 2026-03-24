@@ -501,7 +501,7 @@ The server pushes **text frames** containing JSON such as:
 }
 ```
 
-**Scaling note:** With multiple API replicas, clients usually need **sticky sessions** or a shared pub/sub layer so WebSocket subscribers receive events regardless of which instance they hit.
+**Scaling note:** Status updates use a **RabbitMQ fanout** (each API instance has its own queue), so every replica gets events; the browser WebSocket still lands on one node (use **sticky sessions** if you require affinity). Cluster-wide worker rate limits: optional **Redis** via `REDIS_URL`. Details: [OPERATIONS.md](OPERATIONS.md).
 
 ---
 

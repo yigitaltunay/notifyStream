@@ -29,7 +29,7 @@ The design targets **high throughput**, **at-least-once** messaging semantics wi
 17. [OpenAPI / Swagger](#openapi--swagger)
 18. [Database migrations](#database-migrations)
 19. [Testing and CI](#testing-and-ci)
-20. [Scaling and operational notes](#scaling-and-operational-notes)
+20. [Scaling and operations](OPERATIONS.md)
 
 ---
 
@@ -91,7 +91,7 @@ flowchart TB
 **Process path (workers)**
 
 1. Consume from per-channel queues (`q.notify.sms`, `q.notify.email`, `q.notify.push`).
-2. Enforce **100 messages per second per channel** per worker process using a token-bucket limiter (`golang.org/x/time/rate`).
+2. Enforce **100 messages per second per channel** using `internal/ratelimit`: with **`REDIS_URL`** set, a shared Redis token bucket (`github.com/go-redis/redis_rate`); otherwise an in-memory limiter per worker (`golang.org/x/time/rate`).
 3. Resolve final text: use stored `content` or load a **template** and render `{{variable}}` placeholders from JSON `payload`.
 4. `POST` the outbound JSON to `WEBHOOK_URL`.
 5. Update PostgreSQL (`delivered` / `failed`), and publish a JSON event to the **`notifications.status`** fanout for WebSocket subscribers.
@@ -109,6 +109,7 @@ flowchart TB
 | `internal/db` | PostgreSQL access via `pgxpool` (notifications, batches, templates, outbox, listing, status transitions). |
 | `internal/api` | Chi router, handlers, request logging with correlation ID, Swagger wiring, WebSocket hub. |
 | `internal/delivery` | Webhook HTTP client with transient vs permanent error typing. |
+| `internal/ratelimit` | Per-channel delivery throttle (Redis-backed or in-memory). |
 | `internal/domain` | Validation, priorities, template rendering. |
 | `internal/runner` | `StartOutboxRelay` and `StartScheduler` background loops. |
 | `internal/tracing` | Optional OTLP HTTP exporter setup for API, worker, and scheduler. |
@@ -282,7 +283,7 @@ This gives **at-least-once** publication to the broker in the presence of transi
 
 1. **Eligibility**: Consumers process rows in **`pending`**, **`queued`**, or **`sending`**. Allowing **`pending`** covers a rare race where AMQP publish succeeded but the API or relay could not commit `pending`→`queued` in time; without it, the worker would acknowledge the message while skipping work and the notification could stay stuck. **`MarkQueuedWithRetry`** (API and scheduler) and a transactional retry in the outbox relay reduce how often this happens.
 2. **Validation**: Template/channel mismatch or bad substitution → **permanent** → row `failed`, message **acked**, status event published.
-3. **Rate limit**: Per-channel **100 req/s** (token bucket per worker process).
+3. **Rate limit**: Per-channel **100 req/s** — cluster-wide when **`REDIS_URL`** is set, otherwise per worker process (in-memory).
 4. **Webhook**:
    - **2xx**: `delivered`, store `provider_message_id` if returned.
    - **429**, **5xx**, network errors: **transient** → exponential backoff (base 250ms, cap 30s, small jitter), **republish** same body with incremented `x-retry-count` header, **ack** original message (avoids unbounded local redelivery loops). After **5** retries, mark `failed`.
@@ -381,6 +382,9 @@ Then point processes on the host at `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | no | — | OTLP endpoint for traces (HTTP), e.g. `http://jaeger:4318` when using Docker Compose (Jaeger service). |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | no | — | Alternative to the above; full traces URL if your collector requires it. |
 | `OTEL_SERVICE_NAME` | no | — | Standard OTel resource attribute (also influenced by `resource.WithFromEnv()`). |
+| `REDIS_URL` | no | — | If set (e.g. `redis://redis:6379`), workers share a **cluster-wide** per-channel delivery rate limit (100/s) via Redis; otherwise each worker process uses an in-memory limiter. |
+| `WEBSOCKET_ALLOWED_ORIGINS` | no | — | Comma-separated **exact** `Origin` values allowed for `/v1/ws`. Empty means allow all (development). |
+| `STUCK_SENDING_RECOVERY_SECONDS` | no | `120` | Worker: if a row stays **`sending`** longer than this (seconds), the next delivery attempt resets it to **`queued`** before processing. Set `0` to disable. |
 
 Copy `.env.example` to `.env` for Docker Compose.
 
@@ -396,11 +400,12 @@ docker compose up --build
 
 - **API**: `http://localhost:8080`
 - **Swagger UI**: `http://localhost:8080/swagger/index.html`
+- **Redis**: `localhost:6379` (Compose default; matches `REDIS_URL=redis://redis:6379` in `.env.example`)
 - **RabbitMQ management**: `http://localhost:15672` (`guest` / `guest`)
 - **Worker metrics** (if `METRICS_ADDR=:9091` in `.env`): `http://localhost:9091/metrics`
 - **Jaeger**: UI [http://localhost:16686](http://localhost:16686), OTLP HTTP port **4318** (set `OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318` in `.env` to export traces)
 
-The **scheduler** and **worker** services wait for the API container to **start** so migrations can run first. Run **one** scheduler task in production unless you add coordination for multiple schedulers.
+The **scheduler** and **worker** services wait for the API container to **start** so migrations can run first. For replica counts, rate limits across workers, WebSocket scaling, and secrets, see **[OPERATIONS.md](OPERATIONS.md)**.
 
 ---
 
@@ -442,16 +447,6 @@ SQL files live in `migrations/` following golang-migrate naming (`000001_initial
 - **CI**: `.github/workflows/ci.yml` runs tests and `golangci-lint` on pushes and pull requests to `main` / `master`.
 
 Integration tests with Testcontainers are not included in the default suite; the webhook client is intended to be tested against `httptest.Server` in CI-friendly tests if you extend coverage.
-
----
-
-## Scaling and operational notes
-
-- **Horizontal workers**: Multiple worker replicas increase throughput but **each** enforces 100 msg/s per channel in memory. For a **global** cap across replicas, introduce a distributed limiter (for example Redis).
-- **Scheduler / outbox**: Deploy **`cmd/scheduler` as a single replica** (Compose: one `scheduler` service). Scaling API horizontally no longer multiplies scheduler or outbox relays. If you run multiple scheduler replicas, add row locking (`FOR UPDATE SKIP LOCKED`) or leader election to prevent duplicate publishes.
-- **PostgreSQL**: Listing uses cursor pagination on `(created_at DESC, id DESC)`; tune indexes as volume grows.
-- **Secrets**: Do not commit `.env`; use your orchestrator’s secret management in production.
-- **WebSocket**: The hub is in-process; scale WebSocket either with sticky sessions or a shared pub/sub layer (Redis, etc.) if you run multiple API replicas.
 
 ---
 

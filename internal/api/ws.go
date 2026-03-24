@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 
 	"github.com/google/uuid"
@@ -13,9 +15,34 @@ import (
 var wsUpgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
+}
+
+func websocketCheckOrigin() func(*http.Request) bool {
+	raw := strings.TrimSpace(os.Getenv("WEBSOCKET_ALLOWED_ORIGINS"))
+	if raw == "" {
+		return func(*http.Request) bool { return true }
+	}
+	var allowed []string
+	for _, p := range strings.Split(raw, ",") {
+		if s := strings.TrimSpace(p); s != "" {
+			allowed = append(allowed, s)
+		}
+	}
+	if len(allowed) == 0 {
+		return func(*http.Request) bool { return true }
+	}
+	return func(r *http.Request) bool {
+		o := r.Header.Get("Origin")
+		if o == "" {
+			return true
+		}
+		for _, a := range allowed {
+			if o == a {
+				return true
+			}
+		}
+		return false
+	}
 }
 
 type WSHub struct {
@@ -152,7 +179,9 @@ func (h *WSHub) HandleWS(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "notification_id or batch_id required", http.StatusBadRequest)
 		return
 	}
-	c, err := wsUpgrader.Upgrade(w, r, nil)
+	u := wsUpgrader
+	u.CheckOrigin = websocketCheckOrigin()
+	c, err := u.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}

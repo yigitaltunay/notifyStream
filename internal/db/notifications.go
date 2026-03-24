@@ -127,6 +127,15 @@ func (s *Store) scanNotification(row pgx.Row) (domain.Notification, error) {
 	return scanNotificationRow(row)
 }
 
+func (s *Store) ReleaseSendingToQueued(ctx context.Context, id uuid.UUID) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE notifications
+		SET status = 'queued', updated_at = now()
+		WHERE id = $1 AND status = 'sending'
+	`, id)
+	return err
+}
+
 func (s *Store) MarkSending(ctx context.Context, id uuid.UUID) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE notifications
@@ -248,13 +257,13 @@ func (s *Store) ListByBatchID(ctx context.Context, batchID uuid.UUID) ([]domain.
 }
 
 type ListParams struct {
-	Status    *domain.Status
-	Channel   *domain.Channel
-	From      *time.Time
-	To        *time.Time
-	CursorAt  *time.Time
-	CursorID  *uuid.UUID
-	Limit     int
+	Status   *domain.Status
+	Channel  *domain.Channel
+	From     *time.Time
+	To       *time.Time
+	CursorAt *time.Time
+	CursorID *uuid.UUID
+	Limit    int
 }
 
 func (s *Store) List(ctx context.Context, p ListParams) ([]domain.Notification, error) {

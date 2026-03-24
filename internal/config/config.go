@@ -18,6 +18,7 @@ type Config struct {
 	WebhookURL  string
 	HTTPAddr    string
 	MetricsAddr string
+	RedisURL    string
 }
 
 func Load(requireWebhook bool) (Config, error) {
@@ -27,6 +28,7 @@ func Load(requireWebhook bool) (Config, error) {
 		WebhookURL:  strings.TrimSpace(os.Getenv("WEBHOOK_URL")),
 		HTTPAddr:    strings.TrimSpace(os.Getenv("HTTP_ADDR")),
 		MetricsAddr: strings.TrimSpace(os.Getenv("METRICS_ADDR")),
+		RedisURL:    strings.TrimSpace(os.Getenv("REDIS_URL")),
 	}
 	if c.HTTPAddr == "" {
 		c.HTTPAddr = ":8080"
