@@ -31,6 +31,26 @@ const docTemplate = `{
                 }
             }
         },
+        "/metrics": {
+            "get": {
+                "description": "OpenMetrics / Prometheus text exposition (not JSON). Counters and histograms use names prefixed with notifystream_.",
+                "produces": [
+                    "text/plain"
+                ],
+                "tags": [
+                    "observability"
+                ],
+                "summary": "Prometheus metrics",
+                "responses": {
+                    "200": {
+                        "description": "text/plain; version=0.0.4",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
         "/readyz": {
             "get": {
                 "tags": [

@@ -10,6 +10,8 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
+var prometheusHTTPHandler = promhttp.Handler()
+
 func NewRouter(h *Handler, hub *WSHub) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -20,7 +22,7 @@ func NewRouter(h *Handler, hub *WSHub) http.Handler {
 
 	r.Get("/healthz", healthz)
 	r.Get("/readyz", h.Readyz)
-	r.Handle("/metrics", promhttp.Handler())
+	r.Get("/metrics", prometheusMetrics)
 	r.Get("/swagger/*", httpSwagger.WrapHandler)
 
 	r.Route("/v1", func(r chi.Router) {
@@ -45,6 +47,16 @@ func NewRouter(h *Handler, hub *WSHub) http.Handler {
 func healthz(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok\n"))
+}
+
+// @Summary Prometheus metrics
+// @Description OpenMetrics / Prometheus text exposition (not JSON). Counters and histograms use names prefixed with notifystream_.
+// @Tags observability
+// @Produce plain
+// @Success 200 {string} string "text/plain; version=0.0.4"
+// @Router /metrics [get]
+func prometheusMetrics(w http.ResponseWriter, r *http.Request) {
+	prometheusHTTPHandler.ServeHTTP(w, r)
 }
 
 func requestIDToHeader(next http.Handler) http.Handler {

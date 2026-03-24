@@ -4,6 +4,8 @@ NotifyStream is an **event-driven notification platform** written in **Go 1.23**
 
 The design targets **high throughput**, **at-least-once** messaging semantics with explicit retries, **per-channel rate limiting**, **priority-aware** queuing, **idempotent** creation, **scheduled** delivery, **templates** with variable substitution, **real-time status** fan-out over WebSocket, and **observability** (Prometheus metrics, structured logs with correlation IDs, optional OpenTelemetry traces).
 
+**HTTP examples (detailed English cookbook, curl + JSON):** [EXAMPLES.md](EXAMPLES.md) — use when Swagger shows odd types for `batch_metadata` / `payload` (`json.RawMessage`).
+
 ---
 
 ## Table of contents
