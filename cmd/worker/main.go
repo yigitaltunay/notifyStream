@@ -66,7 +66,7 @@ func main() {
 		slog.Error("amqp", "error", err)
 		os.Exit(1)
 	}
-	defer bus.Close()
+	defer func() { _ = bus.Close() }()
 
 	wh := delivery.NewWebhook(cfg.WebhookURL)
 

@@ -73,7 +73,7 @@ func (w *Webhook) Post(ctx context.Context, env amqp.Envelope) (messageID string
 	if err != nil {
 		return "", &TransientError{Detail: err.Error()}
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	respBody, _ := io.ReadAll(io.LimitReader(res.Body, 64<<10))
 	switch {
 	case res.StatusCode >= 200 && res.StatusCode < 300:

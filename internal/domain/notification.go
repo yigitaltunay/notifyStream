@@ -83,7 +83,7 @@ func ValidateCreateItem(i CreateItem) error {
 	if !hasContent && !hasTemplate {
 		return fmt.Errorf("either content or template_id is required")
 	}
-	if hasTemplate && (i.Payload == nil || len(i.Payload) == 0) {
+	if hasTemplate && len(i.Payload) == 0 {
 		return fmt.Errorf("payload is required when template_id is set")
 	}
 	if hasContent {

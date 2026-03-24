@@ -53,7 +53,7 @@ func main() {
 		slog.Error("amqp", "error", err)
 		os.Exit(1)
 	}
-	defer bus.Close()
+	defer func() { _ = bus.Close() }()
 
 	store := db.NewStore(pool)
 	h := api.NewHandler(store, bus)

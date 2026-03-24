@@ -176,7 +176,7 @@ func (h *Handler) CreateNotifications(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "database error"})
 		return
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	var batchID *uuid.UUID
 	if len(items) > 1 {
