@@ -1,167 +1,423 @@
 # NotifyStream
 
-Event-driven notification pipeline in Go: HTTP API persists to PostgreSQL, publishes to RabbitMQ, and workers deliver JSON payloads to a configurable webhook (for example [webhook.site](https://webhook.site)).
+NotifyStream is an **event-driven notification platform** written in **Go 1.23**. It accepts notification requests over HTTP, persists authoritative state in **PostgreSQL**, enqueues work on **RabbitMQ**, and processes deliveries asynchronously via **worker** processes that call an external HTTP provider (for example [webhook.site](https://webhook.site)) simulating SMS, email, and push gateways.
+
+The design targets **high throughput**, **at-least-once** messaging semantics with explicit retries, **per-channel rate limiting**, **priority-aware** queuing, **idempotent** creation, **scheduled** delivery, **templates** with variable substitution, **real-time status** fan-out over WebSocket, and **observability** (Prometheus metrics, structured logs with correlation IDs, optional OpenTelemetry traces).
+
+---
+
+## Table of contents
+
+1. [Architecture](#architecture)
+2. [Components](#components)
+3. [Data model](#data-model)
+4. [Notification lifecycle](#notification-lifecycle)
+5. [RabbitMQ topology](#rabbitmq-topology)
+6. [Message envelope and tracing](#message-envelope-and-tracing)
+7. [API](#api)
+8. [Templates](#templates)
+9. [Scheduled notifications](#scheduled-notifications)
+10. [Outbox pattern](#outbox-pattern)
+11. [Worker delivery and retries](#worker-delivery-and-retries)
+12. [Real-time status (WebSocket)](#real-time-status-websocket)
+13. [Observability](#observability)
+14. [Configuration](#configuration)
+15. [Running with Docker Compose](#running-with-docker-compose)
+16. [Local development](#local-development)
+17. [OpenAPI / Swagger](#openapi--swagger)
+18. [Database migrations](#database-migrations)
+19. [Testing and CI](#testing-and-ci)
+20. [Scaling and operational notes](#scaling-and-operational-notes)
+
+---
 
 ## Architecture
 
 ```mermaid
-flowchart LR
-  Client[API clients]
-  API[HTTP API]
-  DB[(PostgreSQL)]
-  RMQ[(RabbitMQ)]
-  W[Workers]
-  WH[Webhook]
+flowchart TB
+  subgraph clients [Clients]
+    HTTP[HTTP_clients]
+    WS[WebSocket_clients]
+  end
 
-  Client --> API
+  subgraph api_proc [API_process]
+    API[HTTP_router]
+    ST[Status_consumer]
+    HUB[WS_hub]
+  end
+
+  subgraph sched_proc [Scheduler_process]
+    OB[Outbox_relay]
+    SCH[Due_scheduler]
+  end
+
+  subgraph data [Data_and_messaging]
+    DB[(PostgreSQL)]
+    RMQ[(RabbitMQ)]
+  end
+
+  subgraph worker_proc [Worker_processes]
+    W1[Channel_consumers]
+    WH[Webhook_HTTP]
+  end
+
+  HTTP --> API
   API --> DB
-  API -->|publish| RMQ
-  RMQ --> W
-  W --> WH
-  W --> DB
+  API --> RMQ
+  OB --> DB
+  OB --> RMQ
+  SCH --> DB
+  SCH --> RMQ
+  RMQ --> W1
+  W1 --> WH
+  W1 --> DB
+  W1 --> RMQ
+  RMQ --> ST
+  ST --> HUB
+  WS --> HUB
 ```
 
-- **Write path**: The API validates input, inserts rows in a transaction, commits, then publishes to AMQP. If publish fails, a row is written to the `outbox` table for later reconciliation (background publisher can be added separately).
-- **Process path**: Workers consume per-channel queues, apply a per-channel token bucket (100 requests per second), POST to `WEBHOOK_URL`, update notification status, and retry transient failures before dead-lettering.
+**Write path (HTTP `POST /v1/notifications`)**
 
-## Quick start
+1. Validate payload (channel, priority, content or template + payload, size limits).
+2. Begin a database transaction; insert one or more `notifications` rows (and optionally a `notification_batches` row for multi-item requests).
+3. Commit the transaction.
+4. For each **newly inserted** row (not an idempotency replay):
+   - If `scheduled_at` is **absent or in the past** (relative to UTC): publish an AMQP message. On success, mark the row `queued`. On publish failure, insert an `outbox` row for later retry.
+   - If `scheduled_at` is **in the future**: leave the row `pending`; the **`scheduler` process** (`cmd/scheduler`) will publish when due.
 
-Prerequisites: Docker and Docker Compose.
+**Process path (workers)**
 
-1. Copy this repository and set `WEBHOOK_URL` in `docker-compose.yml` to your webhook endpoint, for example `https://webhook.site/<your-uuid>`.
-2. Start the stack:
+1. Consume from per-channel queues (`q.notify.sms`, `q.notify.email`, `q.notify.push`).
+2. Enforce **100 messages per second per channel** per worker process using a token-bucket limiter (`golang.org/x/time/rate`).
+3. Resolve final text: use stored `content` or load a **template** and render `{{variable}}` placeholders from JSON `payload`.
+4. `POST` the outbound JSON to `WEBHOOK_URL`.
+5. Update PostgreSQL (`delivered` / `failed`), and publish a JSON event to the **`notifications.status`** fanout for WebSocket subscribers.
 
-```bash
-docker compose up --build
-```
+---
 
-3. Open [Swagger UI](http://localhost:8080/swagger/index.html) for the live OpenAPI surface.
-4. RabbitMQ management UI: [http://localhost:15672](http://localhost:15672) (default user and password `guest` / `guest`).
+## Components
 
-### Ports
+| Artifact | Role |
+| -------- | ---- |
+| `cmd/api` | HTTP API, runs embedded migrations on startup, AMQP publisher for creates, **status** consumer feeding the WebSocket hub. |
+| `cmd/scheduler` | Dedicated process: **outbox relay** and **due-time scheduler** (poll interval 2s). Run **one replica** (or add leader election) to avoid duplicate publishes. |
+| `cmd/worker` | One or more OS processes (Compose runs one) consuming RabbitMQ and performing webhook delivery. Optional dedicated `/metrics` listener when `METRICS_ADDR` is set. |
+| `internal/amqp` | Declares exchanges/queues, publishes notifications and status events, consumes work and (on API) status messages. |
+| `internal/db` | PostgreSQL access via `pgxpool` (notifications, batches, templates, outbox, listing, status transitions). |
+| `internal/api` | Chi router, handlers, request logging with correlation ID, Swagger wiring, WebSocket hub. |
+| `internal/delivery` | Webhook HTTP client with transient vs permanent error typing. |
+| `internal/domain` | Validation, priorities, template rendering. |
+| `internal/runner` | `StartOutboxRelay` and `StartScheduler` background loops. |
+| `internal/tracing` | Optional OTLP HTTP exporter setup for API, worker, and scheduler. |
+| `internal/metrics` | Prometheus metric definitions (counters and histograms). |
 
-| Service    | Port  |
-| ---------- | ----- |
-| API        | 8080  |
-| Worker metrics | 9091 |
-| PostgreSQL | 5432  |
-| RabbitMQ AMQP | 5672 |
-| RabbitMQ management | 15672 |
+The **Dockerfile** builds one image with `/app/api`, `/app/worker`, and `/app/scheduler`; Compose selects the command per service.
 
-## Environment variables
+---
 
-| Variable        | Required | Default   | Description |
-| --------------- | -------- | --------- | ----------- |
-| `DATABASE_URL`  | yes      | —         | PostgreSQL connection string |
-| `AMQP_URL`      | yes      | —         | RabbitMQ AMQP URL |
-| `WEBHOOK_URL`   | worker: yes; API: optional for process | — | POST target for deliveries |
-| `HTTP_ADDR`     | no       | `:8080`   | API listen address |
-| `METRICS_ADDR`  | no       | (empty)   | Worker Prometheus metrics (`/metrics`) when set |
+## Data model
+
+Schema is defined under `migrations/` (see [Database migrations](#database-migrations)). Notable entities:
+
+- **`notifications`**: Core row with `recipient`, `channel` (`sms` \| `email` \| `push`), `priority` (`high` \| `normal` \| `low`), `status`, optional `batch_id`, optional `idempotency_key` (partial unique index), optional `scheduled_at`, `correlation_id`, `provider_message_id`, either inline `content` or `template_id` + `payload` (JSONB).
+- **`notification_batches`**: Optional header for batch creates (metadata JSON + count).
+- **`templates`**: Named template per channel; body supports `{{key}}` placeholders.
+- **`outbox`**: Stores failed AMQP publish attempts for asynchronous retry (`published_at` NULL until relay succeeds).
+
+---
+
+## Notification lifecycle
+
+| Status | Meaning |
+| ------ | ------- |
+| `pending` | Persisted; not yet successfully published to RabbitMQ, or waiting for `scheduled_at`. |
+| `queued` | Message published to RabbitMQ; awaiting worker. |
+| `sending` | Worker claimed the message and passed pre-send validation; delivery in progress / retrying. |
+| `delivered` | Webhook returned success (2xx); optional `messageId` stored. |
+| `failed` | Permanent validation/delivery failure or retries exhausted. |
+| `cancelled` | Terminal; only from `pending` or `queued` via cancel API. |
+
+Workers **skip** processing when the row is already `cancelled` or `delivered`.
+
+---
 
 ## RabbitMQ topology
 
-| Piece | Purpose |
-| ----- | ------- |
-| Exchange `notifications.topic` (`topic`) | Routes work to channel queues |
-| Routing keys | `notify.{channel}.{priority}` with `channel` in `sms`, `email`, `push` and `priority` in `high`, `normal`, `low` |
-| Queues | `q.notify.sms`, `q.notify.email`, `q.notify.push` with `x-max-priority` (10) |
-| Dead letter | `notifications.dlx` → `q.notify.dlq` (`notify.dlq`) |
+| Name | Type | Purpose |
+| ---- | ---- | ------- |
+| `notifications.topic` | topic | Publishes work with routing key `notify.{channel}.{priority}`. |
+| `q.notify.sms`, `q.notify.email`, `q.notify.push` | classic queue | One queue per channel; `x-max-priority=10` maps API priority to RabbitMQ message priority (high=10, normal=5, low=1). |
+| `notifications.dlx` | direct | Dead-letter exchange. |
+| `q.notify.dlq` | queue | Binds to `notify.dlq`; receives messages nacked without requeue from work queues. |
+| `notifications.status` | fanout | Workers publish JSON status events; API binds an **exclusive, auto-delete** queue per connection for WebSocket fan-out. |
 
-## API examples
+**Prefetch**: Consumers use QoS prefetch (10) so multiple deliveries can be in flight while the per-channel rate limiter shapes actual webhook throughput.
 
-Replace `BASE` with your API origin (for example `http://localhost:8080`).
+---
 
-**Create a single SMS notification**
+## Message envelope and tracing
+
+Published work messages are JSON envelopes (`internal/amqp.Envelope`) including `id`, `recipient`, `channel`, optional `content`, optional `template_id` / `payload`, `priority`, and optional `correlation_id`.
+
+**OpenTelemetry**: When a tracer is configured, the API **injects** W3C trace context into AMQP headers on publish. Workers **extract** context before handling a delivery and attach an instrumented HTTP transport to the webhook client, so traces can span API → broker → worker → downstream HTTP when an OTLP endpoint is available.
+
+---
+
+## API
+
+Base path: **`/v1`**. Correlation: prefer header **`X-Request-ID`**; Chi `RequestID` middleware also assigns one and echoes it on the response.
+
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| `POST` | `/v1/notifications` | Create one or more notifications (max **1000** per request). Supports `batch_metadata` when more than one item (creates a batch). |
+| `GET` | `/v1/notifications` | List with filters: `status`, `channel`, `from`, `to` (RFC3339), `limit` (1–100), cursor `next_cursor` / `cursor` pagination. |
+| `GET` | `/v1/notifications/{id}` | Get single notification by UUID. |
+| `POST` | `/v1/notifications/{id}/cancel` | Cancel if `pending` or `queued`. |
+| `GET` | `/v1/batches/{batchId}/notifications` | List all notifications in a batch. |
+| `POST` | `/v1/templates` | Create a named template (409 on duplicate `name`). |
+| `GET` | `/v1/ws` | WebSocket upgrade; query `notification_id` and/or `batch_id`. |
+
+**Health and metrics (unversioned)**
+
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| `GET` | `/healthz` | Liveness. |
+| `GET` | `/readyz` | Readiness: PostgreSQL ping + AMQP connectivity check. |
+| `GET` | `/metrics` | Prometheus exposition (API process). |
+| `GET` | `/swagger/*` | Swagger UI (generated spec). |
+
+### Content validation (summary)
+
+- **SMS**: single body string; max length enforced (see `internal/domain/notification.go`).
+- **Email**: first line of `content` = subject, remainder = body; subject and body size limits enforced.
+- **Push**: first line = title, optional second segment = body; length limits enforced.
+- Either **`content`** or **`template_id` + `payload`** is required per item.
+
+### Idempotency
+
+If `idempotency_key` is provided and duplicates an existing row, the API returns the stored notification with `inserted: false` in the response shape and does **not** enqueue a duplicate message.
+
+### Example: create immediate SMS
+
+The first example is minimal. The second repeats the same payload with an optional **`idempotency_key`**: if the client retries after a timeout or network error, a duplicate key returns the existing row (`inserted: false`) and does **not** publish another broker message.
+
+**Minimal**
 
 ```bash
-curl -sS -X POST "$BASE/v1/notifications" \
+curl -sS -X POST "http://localhost:8080/v1/notifications" \
   -H 'Content-Type: application/json' \
   -d '{
-    "notifications": [
-      {
-        "recipient": "+15551234567",
-        "channel": "sms",
-        "content": "Hello from NotifyStream",
-        "priority": "normal"
-      }
-    ]
+    "notifications": [{
+      "recipient": "+905551234567",
+      "channel": "sms",
+      "content": "Your message",
+      "priority": "normal"
+    }]
   }'
 ```
 
-**Create with idempotency**
+**With idempotency (recommended for production sends)**
 
 ```bash
-curl -sS -X POST "$BASE/v1/notifications" \
+curl -sS -X POST "http://localhost:8080/v1/notifications" \
   -H 'Content-Type: application/json' \
-  -H 'X-Request-ID: my-correlation-1' \
+  -H 'X-Request-ID: req-order-991' \
   -d '{
-    "notifications": [
-      {
-        "recipient": "user@example.com",
-        "channel": "email",
-        "content": "Weekly digest\nHere is the body.",
-        "priority": "high",
-        "idempotency_key": "order-123-email"
-      }
-    ]
+    "notifications": [{
+      "recipient": "+905551234567",
+      "channel": "sms",
+      "content": "Your message",
+      "priority": "normal",
+      "idempotency_key": "order-991-sms-receipt"
+    }]
   }'
 ```
 
-Email `content` uses the first line as the subject and the remainder as the body (see validation limits in code). Push uses the first line as title and the second segment as body.
+### Example: webhook.provider contract
 
-**List notifications (cursor pagination)**
+The reference integration expects:
 
-```bash
-curl -sS "$BASE/v1/notifications?status=queued&limit=20"
+`POST {WEBHOOK_URL}`
+
+```json
+{ "to": "+905551234567", "channel": "sms", "content": "Your message", "priority": "normal" }
 ```
 
-**Get one notification**
+A typical simulated success response is **HTTP 202** with:
 
-```bash
-curl -sS "$BASE/v1/notifications/<uuid>"
+```json
+{ "messageId": "uuid-here", "status": "accepted", "timestamp": "ISO8601" }
 ```
 
-**Cancel**
+The client accepts any **2xx** and records `messageId` when present.
 
-```bash
-curl -sS -X POST "$BASE/v1/notifications/<uuid>/cancel"
+---
+
+## Templates
+
+1. `POST /v1/templates` with `name`, `body`, `channel`, optional `variables_schema` (JSON).
+2. Create notifications with `template_id` and `payload` as a JSON object whose keys match `{{key}}` placeholders in the template body.
+3. Workers load the template from PostgreSQL and render text **before** calling the webhook, so the provider receives a plain `content` string.
+
+---
+
+## Scheduled notifications
+
+Set `scheduled_at` (RFC3339) on create. The API **does not** publish to RabbitMQ until the timestamp is due. The **`scheduler` service** runs **`StartScheduler`** (see `internal/runner/background.go`): every 2s it selects `pending` rows with `scheduled_at <= now()`, publishes them, and transitions them to `queued`. This avoids a RabbitMQ delayed-message plugin and keeps scheduling authoritative in PostgreSQL.
+
+---
+
+## Outbox pattern
+
+If `PublishNotification` fails after the HTTP transaction has committed, the API inserts into **`outbox`**. The **`scheduler` service** runs **`StartOutboxRelay`**: it polls unpublished rows, retries publish, then marks the notification `queued` and sets `outbox.published_at`. If the notification is no longer `pending`, the relay marks the outbox row published to drain orphans.
+
+This gives **at-least-once** publication to the broker in the presence of transient broker outages (duplicate deliveries are still possible; workers rely on idempotent provider behavior or business-level idempotency keys for strict exactly-once semantics at the provider).
+
+---
+
+## Worker delivery and retries
+
+1. **Eligibility**: Consumers process rows in **`pending`**, **`queued`**, or **`sending`**. Allowing **`pending`** covers a rare race where AMQP publish succeeded but the API or relay could not commit `pending`→`queued` in time; without it, the worker would acknowledge the message while skipping work and the notification could stay stuck. **`MarkQueuedWithRetry`** (API and scheduler) and a transactional retry in the outbox relay reduce how often this happens.
+2. **Validation**: Template/channel mismatch or bad substitution → **permanent** → row `failed`, message **acked**, status event published.
+3. **Rate limit**: Per-channel **100 req/s** (token bucket per worker process).
+4. **Webhook**:
+   - **2xx**: `delivered`, store `provider_message_id` if returned.
+   - **429**, **5xx**, network errors: **transient** → exponential backoff (base 250ms, cap 30s, small jitter), **republish** same body with incremented `x-retry-count` header, **ack** original message (avoids unbounded local redelivery loops). After **5** retries, mark `failed`.
+   - Other **4xx**: **permanent** → mark `failed`, **ack**.
+
+Malformed AMQP payloads or poison messages may still be **nacked** without requeue and land in **`q.notify.dlq`** depending on consumer behavior. If `mark queued after publish` errors appear in API logs, inspect the row and queue; the worker path above is the safety net.
+
+---
+
+## Real-time status (WebSocket)
+
+Workers publish JSON to **`notifications.status`** after terminal or relevant transitions, for example:
+
+```json
+{
+  "notification_id": "uuid",
+  "status": "delivered",
+  "batch_id": "optional-uuid",
+  "correlation_id": "optional"
+}
 ```
 
-**Health and metrics**
+The API process consumes these events on a dedicated queue and pushes them to WebSocket clients subscribed via:
 
-- Liveness: `GET /healthz`
-- Readiness (database + AMQP): `GET /readyz`
-- Prometheus: `GET /metrics` on the API; worker exposes `/metrics` when `METRICS_ADDR` is set.
+`GET /v1/ws?notification_id=<uuid>&batch_id=<uuid>` (at least one query parameter required).
 
-## OpenAPI / Swagger
+---
 
-Spec is generated with [swaggo](https://github.com/swaggo/swag). After changing handler `// @` annotations, regenerate:
+## Observability
+
+### Metrics (Prometheus)
+
+Defined in `internal/metrics/metrics.go` (API registers the default registry; worker may expose its own registry on `METRICS_ADDR`):
+
+| Metric | Type | Labels | Description |
+| ------ | ---- | ------ | ----------- |
+| `notifystream_notifications_sent_total` | counter | `channel` | Successful webhook responses (2xx). |
+| `notifystream_notifications_failed_total` | counter | `channel`, `outcome` | Failures (`permanent`, `retries_exhausted`, `validation`, `unknown`, …). |
+| `notifystream_delivery_latency_seconds` | histogram | `channel` | Worker time from pickup through webhook response. |
+| `notifystream_rate_limit_wait_seconds` | histogram | — | Time blocked on rate limiter. |
+
+**Note:** A **queue depth** gauge backed by the RabbitMQ management HTTP API is listed in the original product brief; the current codebase focuses on the metrics above. You can extend the API or a sidecar to scrape `http://rabbitmq:15672/api/queues` if required.
+
+### Logging
+
+Both binaries use **`log/slog`** with JSON output. HTTP access logs include **`correlation_id`** (from `X-Request-ID` / Chi request ID). Workers attach `correlation_id` and `notification_id` when present on the AMQP envelope or headers.
+
+### Tracing
+
+If `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is set, the API wraps the router with `otelhttp` and the worker uses `otelhttp.NewTransport` for outbound calls, with trace propagation through AMQP headers as described above.
+
+---
+
+## Configuration
+
+| Variable | Required | Default | Description |
+| -------- | -------- | ------- | ----------- |
+| `DATABASE_URL` | yes | — | PostgreSQL DSN (e.g. `postgres://user:pass@host:5432/db?sslmode=disable`). |
+| `AMQP_URL` | yes | — | RabbitMQ AMQP URI (e.g. `amqp://guest:guest@rabbitmq:5672/`). |
+| `WEBHOOK_URL` | worker: yes | — | Full URL of the external notification provider. |
+| `HTTP_ADDR` | no | `:8080` | API listen address. |
+| `METRICS_ADDR` | no | empty | If set (e.g. `:9091`), worker serves `GET /metrics`. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | no | — | OTLP endpoint for traces (see OpenTelemetry docs for format). |
+| `OTEL_SERVICE_NAME` | no | — | Standard OTel resource attribute (also influenced by `resource.WithFromEnv()`). |
+
+Copy `.env.example` to `.env` for Docker Compose.
+
+---
+
+## Running with Docker Compose
 
 ```bash
-go run github.com/swaggo/swag/cmd/swag@latest init -g cmd/api/main.go -o docs
+cp .env.example .env
+# Set WEBHOOK_URL to your https://webhook.site/<uuid>
+docker compose up --build
 ```
 
-The API serves **Swagger UI** at `/swagger/*` (for example [http://localhost:8080/swagger/index.html](http://localhost:8080/swagger/index.html)).
+- **API**: `http://localhost:8080`
+- **Swagger UI**: `http://localhost:8080/swagger/index.html`
+- **RabbitMQ management**: `http://localhost:15672` (`guest` / `guest`)
+- **Worker metrics** (if `METRICS_ADDR=:9091` in `.env`): `http://localhost:9091/metrics`
 
-## Delivery and retry
+The **scheduler** and **worker** services wait for the API container to **start** so migrations can run first. Run **one** scheduler task in production unless you add coordination for multiple schedulers.
 
-1. Workers consume from `q.notify.{sms|email|push}` with prefetch QoS.
-2. Each channel uses an in-memory token bucket at **100 events per second** per worker process. For multiple worker replicas, use a shared limiter (for example Redis) if you need a global cap.
-3. The webhook client POSTs JSON `{ "to", "channel", "content?", "payload?", "priority" }` with a 10s timeout. Successful responses are **2xx**; optional `{"messageId":"..."}` in the body is stored as `provider_message_id`.
-4. **429** and **5xx** / network errors are treated as transient: exponential backoff (from 250ms, capped at 30s with small jitter), republish with `x-retry-count` header, up to **5** attempts, then the notification is marked `failed`.
-5. Other **4xx** responses are permanent: mark `failed` and **nack without requeue** so the message can dead-letter to `q.notify.dlq`.
-6. Cancelled or already delivered notifications are skipped when consumed.
+---
 
 ## Local development
 
-```bash
-make test
-```
-
-Lint (requires [golangci-lint](https://golangci-lint.run/) on your PATH, or use the Docker image `golangci/golangci-lint`):
+Requirements: Go 1.23+, PostgreSQL, RabbitMQ (or use Compose for dependencies only).
 
 ```bash
-make lint
+make test        # go test ./...
+make lint        # requires golangci-lint on PATH
+make swagger     # regenerate docs after changing // @ annotations
 ```
 
-Continuous integration runs `make test` and `golangci-lint` on pushes and pull requests to `main` and `master` (see `.github/workflows/ci.yml`).
+Run **`go run ./cmd/api`**, **`go run ./cmd/scheduler`**, and **`go run ./cmd/worker`** (scheduler and worker need `DATABASE_URL` and `AMQP_URL`; worker also needs `WEBHOOK_URL`). Same variables as `.env.example`.
+
+---
+
+## OpenAPI / Swagger
+
+The API contract is generated with **[swaggo/swag](https://github.com/swaggo/swag)** from comments on handlers in `internal/api` and `cmd/api`. Generated artifacts live under **`docs/`** (`docs.go`, `swagger.json`, `swagger.yaml`).
+
+```bash
+make swagger
+```
+
+Do not hand-edit `swagger.json` as the source of truth; regenerate after annotation changes.
+
+---
+
+## Database migrations
+
+SQL files live in `migrations/` following golang-migrate naming (`000001_initial.up.sql` / `.down.sql`). The API invokes **`migrate.Up`** on startup (`internal/migrate`). For manual runs, use the `migrate` CLI with the same DSN if preferred.
+
+---
+
+## Testing and CI
+
+- **Unit tests**: `make test` (or `go test ./...`), including domain validation and template rendering tests.
+- **CI**: `.github/workflows/ci.yml` runs tests and `golangci-lint` on pushes and pull requests to `main` / `master`.
+
+Integration tests with Testcontainers are not included in the default suite; the webhook client is intended to be tested against `httptest.Server` in CI-friendly tests if you extend coverage.
+
+---
+
+## Scaling and operational notes
+
+- **Horizontal workers**: Multiple worker replicas increase throughput but **each** enforces 100 msg/s per channel in memory. For a **global** cap across replicas, introduce a distributed limiter (for example Redis).
+- **Scheduler / outbox**: Deploy **`cmd/scheduler` as a single replica** (Compose: one `scheduler` service). Scaling API horizontally no longer multiplies scheduler or outbox relays. If you run multiple scheduler replicas, add row locking (`FOR UPDATE SKIP LOCKED`) or leader election to prevent duplicate publishes.
+- **PostgreSQL**: Listing uses cursor pagination on `(created_at DESC, id DESC)`; tune indexes as volume grows.
+- **Secrets**: Do not commit `.env`; use your orchestrator’s secret management in production.
+- **WebSocket**: The hub is in-process; scale WebSocket either with sticky sessions or a shared pub/sub layer (Redis, etc.) if you run multiple API replicas.
+
+---
+
+## License
+
+Specify your license in a `LICENSE` file at the repository root if you distribute this project.

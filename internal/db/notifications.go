@@ -131,13 +131,13 @@ func (s *Store) MarkSending(ctx context.Context, id uuid.UUID) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE notifications
 		SET status = 'sending', updated_at = now()
-		WHERE id = $1 AND status IN ('queued', 'sending')
+		WHERE id = $1 AND status IN ('pending', 'queued', 'sending')
 	`, id)
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("notification %s not queued or sending", id)
+		return fmt.Errorf("notification %s not pending, queued or sending", id)
 	}
 	return nil
 }
@@ -161,7 +161,7 @@ func (s *Store) MarkFailed(ctx context.Context, id uuid.UUID) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE notifications
 		SET status = 'failed', updated_at = now()
-		WHERE id = $1 AND status IN ('queued', 'sending')
+		WHERE id = $1 AND status IN ('pending', 'queued', 'sending')
 	`, id)
 	if err != nil {
 		return err

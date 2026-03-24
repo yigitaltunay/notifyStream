@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -206,6 +207,7 @@ func (h *Handler) CreateNotifications(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	now := time.Now().UTC()
 	for i := range results {
 		if !results[i].Inserted {
 			continue
@@ -215,23 +217,34 @@ func (h *Handler) CreateNotifications(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue
 		}
+		if n.ScheduledAt != nil && n.ScheduledAt.After(now) {
+			continue
+		}
 		pubErr := h.bus.PublishNotification(ctx, n)
-		tx2, err := h.store.Pool().Begin(ctx)
-		if err != nil {
-			continue
-		}
 		if pubErr != nil {
-			_ = h.store.EnqueueOutbox(ctx, tx2, id, map[string]any{
+			tx2, err := h.store.Pool().Begin(ctx)
+			if err != nil {
+				slog.Error("outbox begin", "error", err, "notification_id", id)
+				continue
+			}
+			if err := h.store.EnqueueOutbox(ctx, tx2, id, map[string]any{
 				"error": pubErr.Error(),
-			})
-			_ = tx2.Commit(ctx)
+			}); err != nil {
+				_ = tx2.Rollback(ctx)
+				slog.Error("enqueue outbox", "error", err, "notification_id", id)
+				continue
+			}
+			if err := tx2.Commit(ctx); err != nil {
+				slog.Error("outbox commit", "error", err, "notification_id", id)
+				continue
+			}
 			continue
 		}
-		if err := h.store.MarkQueued(ctx, tx2, id); err != nil {
-			_ = tx2.Rollback(ctx)
+		if err := h.store.MarkQueuedWithRetry(ctx, id, 5, 30*time.Millisecond); err != nil {
+			slog.Error("mark queued after publish", "error", err, "notification_id", id,
+				"hint", "worker accepts pending+queue orphan; reconcile or inspect DB")
 			continue
 		}
-		_ = tx2.Commit(ctx)
 		results[i].Status = string(domain.StatusQueued)
 	}
 

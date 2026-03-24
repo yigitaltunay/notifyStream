@@ -25,6 +25,8 @@ import (
 	"github.com/yaltunay/notifystream/internal/delivery"
 	"github.com/yaltunay/notifystream/internal/domain"
 	"github.com/yaltunay/notifystream/internal/metrics"
+	"github.com/yaltunay/notifystream/internal/tracing"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 const maxWebhookRetries = 5
@@ -40,6 +42,13 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	shutdownTrace, err := tracing.Setup(ctx, "notifystream-worker")
+	if err != nil {
+		slog.Error("tracing", "error", err)
+		os.Exit(1)
+	}
+	defer func() { _ = shutdownTrace(context.Background()) }()
 
 	if cfg.MetricsAddr != "" {
 		mux := http.NewServeMux()
@@ -68,7 +77,7 @@ func main() {
 	}
 	defer func() { _ = bus.Close() }()
 
-	wh := delivery.NewWebhook(cfg.WebhookURL)
+	wh := delivery.NewWebhook(cfg.WebhookURL, otelhttp.NewTransport(http.DefaultTransport))
 
 	limiters := map[domain.Channel]*rate.Limiter{
 		domain.ChannelSMS:   rate.NewLimiter(rate.Limit(100), 100),
@@ -121,6 +130,7 @@ func enrichEnvelopeFromDelivery(env *amqp.Envelope, d amqp091.Delivery) {
 
 func handleDelivery(ctx context.Context, store *db.Store, bus *amqp.Client, wh *delivery.Webhook, lim *rate.Limiter, ch domain.Channel, d amqp091.Delivery) error {
 	start := time.Now()
+	ctx = amqp.ExtractTraceCtx(ctx, d.Headers)
 	var env amqp.Envelope
 	if err := json.Unmarshal(d.Body, &env); err != nil {
 		slog.Warn("bad message body", "error", err)
@@ -148,9 +158,21 @@ func handleDelivery(ctx context.Context, store *db.Store, bus *amqp.Client, wh *
 	if n.Status == domain.StatusCancelled || n.Status == domain.StatusDelivered {
 		return nil
 	}
-	if n.Status != domain.StatusQueued && n.Status != domain.StatusSending {
+	if n.Status != domain.StatusPending && n.Status != domain.StatusQueued && n.Status != domain.StatusSending {
 		log.Info("skip consume; unexpected status", "status", n.Status)
 		return nil
+	}
+
+	outEnv, berr := buildOutboundEnvelope(ctx, store, n, env)
+	if berr != nil {
+		if delivery.IsPermanent(berr) {
+			metrics.NotificationsFailed.WithLabelValues(chLabel, "validation").Inc()
+			_ = store.MarkFailed(ctx, id)
+			emitStatus(ctx, bus, n, "failed")
+			log.Warn("envelope validation", "error", berr)
+			return nil
+		}
+		return berr
 	}
 
 	if err := store.MarkSending(ctx, id); err != nil {
@@ -168,7 +190,7 @@ func handleDelivery(ctx context.Context, store *db.Store, bus *amqp.Client, wh *
 	}
 	metrics.RateLimitWait.Observe(time.Since(rlWait).Seconds())
 
-	msgID, postErr := wh.Post(ctx, env)
+	msgID, postErr := wh.Post(ctx, outEnv)
 	if postErr == nil {
 		metrics.DeliveryLatency.WithLabelValues(chLabel).Observe(time.Since(start).Seconds())
 		metrics.NotificationsSent.WithLabelValues(chLabel).Inc()
@@ -179,6 +201,7 @@ func handleDelivery(ctx context.Context, store *db.Store, bus *amqp.Client, wh *
 		if err := store.MarkDelivered(ctx, id, mid); err != nil {
 			return err
 		}
+		emitStatus(ctx, bus, n, "delivered")
 		log.Info("delivered")
 		return nil
 	}
@@ -187,15 +210,17 @@ func handleDelivery(ctx context.Context, store *db.Store, bus *amqp.Client, wh *
 		metrics.DeliveryLatency.WithLabelValues(chLabel).Observe(time.Since(start).Seconds())
 		metrics.NotificationsFailed.WithLabelValues(chLabel, "permanent").Inc()
 		_ = store.MarkFailed(ctx, id)
+		emitStatus(ctx, bus, n, "failed")
 		log.Warn("delivery permanent failure", "error", postErr)
-		return postErr
+		return nil
 	}
 
 	if !delivery.IsTransient(postErr) {
 		metrics.NotificationsFailed.WithLabelValues(chLabel, "unknown").Inc()
 		_ = store.MarkFailed(ctx, id)
+		emitStatus(ctx, bus, n, "failed")
 		log.Error("delivery unexpected error", "error", postErr)
-		return postErr
+		return nil
 	}
 
 	rc := amqp.RetryCount(d.Headers)
@@ -203,8 +228,9 @@ func handleDelivery(ctx context.Context, store *db.Store, bus *amqp.Client, wh *
 		metrics.DeliveryLatency.WithLabelValues(chLabel).Observe(time.Since(start).Seconds())
 		metrics.NotificationsFailed.WithLabelValues(chLabel, "retries_exhausted").Inc()
 		_ = store.MarkFailed(ctx, id)
+		emitStatus(ctx, bus, n, "failed")
 		log.Warn("delivery retries exhausted", "error", postErr, "x_retry_count", rc)
-		return postErr
+		return nil
 	}
 
 	backoff := retryBackoff(rc)
@@ -220,6 +246,53 @@ func handleDelivery(ctx context.Context, store *db.Store, bus *amqp.Client, wh *
 	}
 	log.Info("delivery transient; republished", "detail", postErr.Error(), "next_retry", rc+1)
 	return nil
+}
+
+func buildOutboundEnvelope(ctx context.Context, store *db.Store, n domain.Notification, env amqp.Envelope) (amqp.Envelope, error) {
+	out := env
+	out.TemplateID = nil
+	out.Payload = nil
+	if n.Content != nil && strings.TrimSpace(*n.Content) != "" {
+		c := strings.TrimSpace(*n.Content)
+		out.Content = &c
+		return out, nil
+	}
+	if n.TemplateID == nil {
+		return amqp.Envelope{}, &delivery.PermanentError{Detail: "missing content"}
+	}
+	tpl, err := store.GetTemplate(ctx, *n.TemplateID)
+	if err != nil {
+		return amqp.Envelope{}, err
+	}
+	if tpl.Channel != n.Channel {
+		return amqp.Envelope{}, &delivery.PermanentError{Detail: "template channel mismatch"}
+	}
+	text, err := domain.RenderTemplateBody(tpl.Body, n.Payload)
+	if err != nil {
+		return amqp.Envelope{}, &delivery.PermanentError{Detail: err.Error()}
+	}
+	out.Content = &text
+	return out, nil
+}
+
+func emitStatus(ctx context.Context, bus *amqp.Client, n domain.Notification, status string) {
+	ev := map[string]any{
+		"notification_id": n.ID.String(),
+		"status":          status,
+	}
+	if n.BatchID != nil {
+		ev["batch_id"] = n.BatchID.String()
+	}
+	if n.CorrelationID != nil && *n.CorrelationID != "" {
+		ev["correlation_id"] = *n.CorrelationID
+	}
+	b, err := json.Marshal(ev)
+	if err != nil {
+		return
+	}
+	if err := bus.PublishStatus(ctx, b); err != nil {
+		slog.Warn("publish status", "error", err)
+	}
 }
 
 func cloneHeaders(h amqp091.Table) amqp091.Table {

@@ -1,13 +1,13 @@
 basePath: /
 definitions:
-  internal_api.BatchNotificationsResponse:
+  api.BatchNotificationsResponse:
     properties:
       notifications:
         items:
-          $ref: '#/definitions/internal_api.NotificationResponse'
+          $ref: '#/definitions/api.NotificationResponse'
         type: array
     type: object
-  internal_api.CreateNotificationItem:
+  api.CreateNotificationItem:
     properties:
       channel:
         type: string
@@ -28,7 +28,7 @@ definitions:
       template_id:
         type: string
     type: object
-  internal_api.CreateNotificationsRequest:
+  api.CreateNotificationsRequest:
     properties:
       batch_metadata:
         items:
@@ -36,10 +36,10 @@ definitions:
         type: array
       notifications:
         items:
-          $ref: '#/definitions/internal_api.CreateNotificationItem'
+          $ref: '#/definitions/api.CreateNotificationItem'
         type: array
     type: object
-  internal_api.CreateNotificationsResponse:
+  api.CreateNotificationsResponse:
     properties:
       batch_id:
         type: string
@@ -47,24 +47,37 @@ definitions:
         type: integer
       notifications:
         items:
-          $ref: '#/definitions/internal_api.NotificationResponse'
+          $ref: '#/definitions/api.NotificationResponse'
         type: array
     type: object
-  internal_api.ErrorResponse:
+  api.CreateTemplateRequest:
+    properties:
+      body:
+        type: string
+      channel:
+        type: string
+      name:
+        type: string
+      variables_schema:
+        items:
+          type: integer
+        type: array
+    type: object
+  api.ErrorResponse:
     properties:
       error:
         type: string
     type: object
-  internal_api.NotificationListResponse:
+  api.NotificationListResponse:
     properties:
       next_cursor:
         type: string
       notifications:
         items:
-          $ref: '#/definitions/internal_api.NotificationResponse'
+          $ref: '#/definitions/api.NotificationResponse'
         type: array
     type: object
-  internal_api.NotificationResponse:
+  api.NotificationResponse:
     properties:
       batch_id:
         type: string
@@ -100,6 +113,25 @@ definitions:
         type: string
       updated_at:
         type: string
+    type: object
+  api.TemplateResponse:
+    properties:
+      body:
+        type: string
+      channel:
+        type: string
+      created_at:
+        type: string
+      id:
+        type: string
+      name:
+        type: string
+      updated_at:
+        type: string
+      variables_schema:
+        items:
+          type: integer
+        type: array
     type: object
 host: localhost:8080
 info:
@@ -146,11 +178,11 @@ paths:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/internal_api.BatchNotificationsResponse'
+            $ref: '#/definitions/api.BatchNotificationsResponse'
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/internal_api.ErrorResponse'
+            $ref: '#/definitions/api.ErrorResponse'
       summary: List batch notifications
       tags:
       - batches
@@ -199,11 +231,11 @@ paths:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/internal_api.NotificationListResponse'
+            $ref: '#/definitions/api.NotificationListResponse'
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/internal_api.ErrorResponse'
+            $ref: '#/definitions/api.ErrorResponse'
       summary: List notifications
       tags:
       - notifications
@@ -220,18 +252,18 @@ paths:
         name: body
         required: true
         schema:
-          $ref: '#/definitions/internal_api.CreateNotificationsRequest'
+          $ref: '#/definitions/api.CreateNotificationsRequest'
       produces:
       - application/json
       responses:
         "201":
           description: Created
           schema:
-            $ref: '#/definitions/internal_api.CreateNotificationsResponse'
+            $ref: '#/definitions/api.CreateNotificationsResponse'
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/internal_api.ErrorResponse'
+            $ref: '#/definitions/api.ErrorResponse'
       summary: Create notifications
       tags:
       - notifications
@@ -249,15 +281,15 @@ paths:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/internal_api.NotificationResponse'
+            $ref: '#/definitions/api.NotificationResponse'
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/internal_api.ErrorResponse'
+            $ref: '#/definitions/api.ErrorResponse'
         "404":
           description: Not Found
           schema:
-            $ref: '#/definitions/internal_api.ErrorResponse'
+            $ref: '#/definitions/api.ErrorResponse'
       summary: Get notification
       tags:
       - notifications
@@ -275,16 +307,58 @@ paths:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/internal_api.NotificationResponse'
+            $ref: '#/definitions/api.NotificationResponse'
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/internal_api.ErrorResponse'
+            $ref: '#/definitions/api.ErrorResponse'
         "409":
           description: Conflict
           schema:
-            $ref: '#/definitions/internal_api.ErrorResponse'
+            $ref: '#/definitions/api.ErrorResponse'
       summary: Cancel notification
       tags:
       - notifications
+  /v1/templates:
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: Body
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.CreateTemplateRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/api.TemplateResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Create template
+      tags:
+      - templates
+  /v1/ws:
+    get:
+      description: Subscribe with query notification_id and/or batch_id. Server pushes
+        JSON status events.
+      parameters:
+      - description: Notification UUID
+        in: query
+        name: notification_id
+        type: string
+      - description: Batch UUID
+        in: query
+        name: batch_id
+        type: string
+      responses: {}
+      summary: WebSocket status stream
+      tags:
+      - websocket
 swagger: "2.0"

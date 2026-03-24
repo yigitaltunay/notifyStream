@@ -8,16 +8,19 @@ import (
 	"time"
 
 	amqp091 "github.com/rabbitmq/amqp091-go"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 
 	"github.com/yaltunay/notifystream/internal/domain"
 )
 
 const (
-	ExchangeTopic = "notifications.topic"
-	ExchangeDLX   = "notifications.dlx"
-	QueueDLQ      = "q.notify.dlq"
-	RoutingDLQ    = "notify.dlq"
-	HeaderRetry   = "x-retry-count"
+	ExchangeTopic  = "notifications.topic"
+	ExchangeDLX    = "notifications.dlx"
+	ExchangeStatus = "notifications.status"
+	QueueDLQ       = "q.notify.dlq"
+	RoutingDLQ     = "notify.dlq"
+	HeaderRetry    = "x-retry-count"
 )
 
 func RetryCount(headers amqp091.Table) int {
@@ -115,6 +118,9 @@ func declareTopology(ch *amqp091.Channel) error {
 	}
 	if err := ch.ExchangeDeclare(ExchangeTopic, "topic", true, false, false, false, nil); err != nil {
 		return fmt.Errorf("declare topic exchange: %w", err)
+	}
+	if err := ch.ExchangeDeclare(ExchangeStatus, "fanout", true, false, false, false, nil); err != nil {
+		return fmt.Errorf("declare status exchange: %w", err)
 	}
 	args := amqp091.Table{
 		"x-dead-letter-exchange":    ExchangeDLX,
@@ -216,7 +222,44 @@ func (c *Client) PublishNotification(ctx context.Context, n domain.Notification)
 	if n.CorrelationID != nil && *n.CorrelationID != "" {
 		pub.Headers["correlation_id"] = *n.CorrelationID
 	}
+	mc := make(propagation.MapCarrier)
+	otel.GetTextMapPropagator().Inject(ctx, &mc)
+	for k, v := range mc {
+		pub.Headers[k] = v
+	}
 	return ch.PublishWithContext(ctx, ExchangeTopic, routingKey, false, false, pub)
+}
+
+func (c *Client) PublishStatus(ctx context.Context, body []byte) error {
+	c.mu.Lock()
+	ch := c.ch
+	c.mu.Unlock()
+	if ch == nil {
+		return fmt.Errorf("amqp publish status: no channel")
+	}
+	pub := amqp091.Publishing{
+		ContentType:  "application/json",
+		DeliveryMode: amqp091.Persistent,
+		Timestamp:    time.Now().UTC(),
+		Body:         body,
+	}
+	return ch.PublishWithContext(ctx, ExchangeStatus, "", false, false, pub)
+}
+
+func ExtractTraceCtx(ctx context.Context, headers amqp091.Table) context.Context {
+	if len(headers) == 0 {
+		return ctx
+	}
+	mc := make(propagation.MapCarrier)
+	for k, v := range headers {
+		switch s := v.(type) {
+		case string:
+			mc[k] = s
+		case []byte:
+			mc[k] = string(s)
+		}
+	}
+	return otel.GetTextMapPropagator().Extract(ctx, mc)
 }
 
 func (c *Client) RepublishDelivery(ctx context.Context, routingKey string, body []byte, priority uint8, headers amqp091.Table) error {
@@ -241,6 +284,50 @@ func (c *Client) RepublishDelivery(ctx context.Context, routingKey string, body 
 		Headers:      h,
 	}
 	return ch.PublishWithContext(ctx, ExchangeTopic, routingKey, false, false, pub)
+}
+
+func (c *Client) ConsumeStatus(ctx context.Context, handler func(context.Context, amqp091.Delivery) error) error {
+	c.mu.Lock()
+	conn := c.conn
+	c.mu.Unlock()
+	if conn == nil || conn.IsClosed() {
+		return fmt.Errorf("amqp consume status: not connected")
+	}
+	subCh, err := conn.Channel()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = subCh.Close() }()
+	q, err := subCh.QueueDeclare("", false, true, true, false, nil)
+	if err != nil {
+		return err
+	}
+	if err := subCh.QueueBind(q.Name, "", ExchangeStatus, false, nil); err != nil {
+		return err
+	}
+	tag := "api-status"
+	msgs, err := subCh.Consume(q.Name, tag, false, false, false, false, nil)
+	if err != nil {
+		return err
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			_ = subCh.Cancel(tag, false)
+			return ctx.Err()
+		case d, ok := <-msgs:
+			if !ok {
+				return fmt.Errorf("status consumer channel closed")
+			}
+			if err := handler(ctx, d); err != nil {
+				_ = d.Nack(false, true)
+				continue
+			}
+			if err := d.Ack(false); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 func (c *Client) Consume(ctx context.Context, ch domain.Channel, handler func(context.Context, amqp091.Delivery) error) error {

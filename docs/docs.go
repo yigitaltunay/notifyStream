@@ -75,13 +75,13 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/internal_api.BatchNotificationsResponse"
+                            "$ref": "#/definitions/api.BatchNotificationsResponse"
                         }
                     },
                     "400": {
                         "description": "Bad Request",
                         "schema": {
-                            "$ref": "#/definitions/internal_api.ErrorResponse"
+                            "$ref": "#/definitions/api.ErrorResponse"
                         }
                     }
                 }
@@ -152,13 +152,13 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/internal_api.NotificationListResponse"
+                            "$ref": "#/definitions/api.NotificationListResponse"
                         }
                     },
                     "400": {
                         "description": "Bad Request",
                         "schema": {
-                            "$ref": "#/definitions/internal_api.ErrorResponse"
+                            "$ref": "#/definitions/api.ErrorResponse"
                         }
                     }
                 }
@@ -187,7 +187,7 @@ const docTemplate = `{
                         "in": "body",
                         "required": true,
                         "schema": {
-                            "$ref": "#/definitions/internal_api.CreateNotificationsRequest"
+                            "$ref": "#/definitions/api.CreateNotificationsRequest"
                         }
                     }
                 ],
@@ -195,13 +195,13 @@ const docTemplate = `{
                     "201": {
                         "description": "Created",
                         "schema": {
-                            "$ref": "#/definitions/internal_api.CreateNotificationsResponse"
+                            "$ref": "#/definitions/api.CreateNotificationsResponse"
                         }
                     },
                     "400": {
                         "description": "Bad Request",
                         "schema": {
-                            "$ref": "#/definitions/internal_api.ErrorResponse"
+                            "$ref": "#/definitions/api.ErrorResponse"
                         }
                     }
                 }
@@ -229,19 +229,19 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/internal_api.NotificationResponse"
+                            "$ref": "#/definitions/api.NotificationResponse"
                         }
                     },
                     "400": {
                         "description": "Bad Request",
                         "schema": {
-                            "$ref": "#/definitions/internal_api.ErrorResponse"
+                            "$ref": "#/definitions/api.ErrorResponse"
                         }
                     },
                     "404": {
                         "description": "Not Found",
                         "schema": {
-                            "$ref": "#/definitions/internal_api.ErrorResponse"
+                            "$ref": "#/definitions/api.ErrorResponse"
                         }
                     }
                 }
@@ -269,38 +269,101 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/internal_api.NotificationResponse"
+                            "$ref": "#/definitions/api.NotificationResponse"
                         }
                     },
                     "400": {
                         "description": "Bad Request",
                         "schema": {
-                            "$ref": "#/definitions/internal_api.ErrorResponse"
+                            "$ref": "#/definitions/api.ErrorResponse"
                         }
                     },
                     "409": {
                         "description": "Conflict",
                         "schema": {
-                            "$ref": "#/definitions/internal_api.ErrorResponse"
+                            "$ref": "#/definitions/api.ErrorResponse"
                         }
                     }
                 }
             }
+        },
+        "/v1/templates": {
+            "post": {
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "templates"
+                ],
+                "summary": "Create template",
+                "parameters": [
+                    {
+                        "description": "Body",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/api.CreateTemplateRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/api.TemplateResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/api.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/v1/ws": {
+            "get": {
+                "description": "Subscribe with query notification_id and/or batch_id. Server pushes JSON status events.",
+                "tags": [
+                    "websocket"
+                ],
+                "summary": "WebSocket status stream",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Notification UUID",
+                        "name": "notification_id",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Batch UUID",
+                        "name": "batch_id",
+                        "in": "query"
+                    }
+                ],
+                "responses": {}
+            }
         }
     },
     "definitions": {
-        "internal_api.BatchNotificationsResponse": {
+        "api.BatchNotificationsResponse": {
             "type": "object",
             "properties": {
                 "notifications": {
                     "type": "array",
                     "items": {
-                        "$ref": "#/definitions/internal_api.NotificationResponse"
+                        "$ref": "#/definitions/api.NotificationResponse"
                     }
                 }
             }
         },
-        "internal_api.CreateNotificationItem": {
+        "api.CreateNotificationItem": {
             "type": "object",
             "properties": {
                 "channel": {
@@ -332,7 +395,7 @@ const docTemplate = `{
                 }
             }
         },
-        "internal_api.CreateNotificationsRequest": {
+        "api.CreateNotificationsRequest": {
             "type": "object",
             "properties": {
                 "batch_metadata": {
@@ -344,12 +407,12 @@ const docTemplate = `{
                 "notifications": {
                     "type": "array",
                     "items": {
-                        "$ref": "#/definitions/internal_api.CreateNotificationItem"
+                        "$ref": "#/definitions/api.CreateNotificationItem"
                     }
                 }
             }
         },
-        "internal_api.CreateNotificationsResponse": {
+        "api.CreateNotificationsResponse": {
             "type": "object",
             "properties": {
                 "batch_id": {
@@ -361,12 +424,32 @@ const docTemplate = `{
                 "notifications": {
                     "type": "array",
                     "items": {
-                        "$ref": "#/definitions/internal_api.NotificationResponse"
+                        "$ref": "#/definitions/api.NotificationResponse"
                     }
                 }
             }
         },
-        "internal_api.ErrorResponse": {
+        "api.CreateTemplateRequest": {
+            "type": "object",
+            "properties": {
+                "body": {
+                    "type": "string"
+                },
+                "channel": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "variables_schema": {
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                }
+            }
+        },
+        "api.ErrorResponse": {
             "type": "object",
             "properties": {
                 "error": {
@@ -374,7 +457,7 @@ const docTemplate = `{
                 }
             }
         },
-        "internal_api.NotificationListResponse": {
+        "api.NotificationListResponse": {
             "type": "object",
             "properties": {
                 "next_cursor": {
@@ -383,12 +466,12 @@ const docTemplate = `{
                 "notifications": {
                     "type": "array",
                     "items": {
-                        "$ref": "#/definitions/internal_api.NotificationResponse"
+                        "$ref": "#/definitions/api.NotificationResponse"
                     }
                 }
             }
         },
-        "internal_api.NotificationResponse": {
+        "api.NotificationResponse": {
             "type": "object",
             "properties": {
                 "batch_id": {
@@ -441,6 +524,35 @@ const docTemplate = `{
                 },
                 "updated_at": {
                     "type": "string"
+                }
+            }
+        },
+        "api.TemplateResponse": {
+            "type": "object",
+            "properties": {
+                "body": {
+                    "type": "string"
+                },
+                "channel": {
+                    "type": "string"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "updated_at": {
+                    "type": "string"
+                },
+                "variables_schema": {
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
                 }
             }
         }

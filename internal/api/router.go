@@ -7,9 +7,10 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	httpSwagger "github.com/swaggo/http-swagger"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
-func NewRouter(h *Handler) http.Handler {
+func NewRouter(h *Handler, hub *WSHub) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
@@ -28,9 +29,13 @@ func NewRouter(h *Handler) http.Handler {
 		r.Get("/notifications/{id}", h.GetNotification)
 		r.Post("/notifications/{id}/cancel", h.CancelNotification)
 		r.Get("/batches/{batchId}/notifications", h.ListBatchNotifications)
+		r.Post("/templates", h.CreateTemplate)
+		if hub != nil {
+			r.Get("/ws", hub.HandleWS)
+		}
 	})
 
-	return r
+	return otelhttp.NewHandler(r, "notifystream-api")
 }
 
 // @Summary Liveness

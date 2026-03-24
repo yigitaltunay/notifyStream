@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
@@ -14,11 +15,14 @@ import (
 	"syscall"
 	"time"
 
+	amqp091 "github.com/rabbitmq/amqp091-go"
+
 	"github.com/yaltunay/notifystream/internal/amqp"
 	"github.com/yaltunay/notifystream/internal/api"
 	"github.com/yaltunay/notifystream/internal/config"
 	"github.com/yaltunay/notifystream/internal/db"
 	"github.com/yaltunay/notifystream/internal/migrate"
+	"github.com/yaltunay/notifystream/internal/tracing"
 
 	_ "github.com/yaltunay/notifystream/docs"
 	_ "github.com/yaltunay/notifystream/internal/metrics"
@@ -35,6 +39,13 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	shutdownTrace, err := tracing.Setup(ctx, "notifystream-api")
+	if err != nil {
+		slog.Error("tracing", "error", err)
+		os.Exit(1)
+	}
+	defer func() { _ = shutdownTrace(context.Background()) }()
 
 	if err := migrate.Up(db.MigrateDSN(cfg.DatabaseURL)); err != nil {
 		slog.Error("migrate", "error", err)
@@ -57,9 +68,20 @@ func main() {
 
 	store := db.NewStore(pool)
 	h := api.NewHandler(store, bus)
+	hub := api.NewWSHub()
+	go func() {
+		err := bus.ConsumeStatus(ctx, func(c context.Context, d amqp091.Delivery) error {
+			hub.DispatchStatus(d.Body)
+			return nil
+		})
+		if err != nil && !errors.Is(err, context.Canceled) {
+			slog.Error("status consumer", "error", err)
+		}
+	}()
+
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           api.NewRouter(h),
+		Handler:           api.NewRouter(h, hub),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

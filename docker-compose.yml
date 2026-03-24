@@ -42,6 +42,19 @@ services:
       rabbitmq:
         condition: service_healthy
 
+  scheduler:
+    image: notifystream:local
+    command: ["/app/scheduler"]
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      api:
+        condition: service_started
+
   worker:
     image: notifystream:local
     command: ["/app/worker"]

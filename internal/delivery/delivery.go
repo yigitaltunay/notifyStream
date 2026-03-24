@@ -18,11 +18,15 @@ type Webhook struct {
 	Client *http.Client
 }
 
-func NewWebhook(url string) *Webhook {
+func NewWebhook(url string, transport http.RoundTripper) *Webhook {
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
 	return &Webhook{
 		URL: url,
 		Client: &http.Client{
-			Timeout: 10 * time.Second,
+			Timeout:   10 * time.Second,
+			Transport: transport,
 		},
 	}
 }
