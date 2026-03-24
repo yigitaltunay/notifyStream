@@ -11,6 +11,7 @@ type Config struct {
 	AMQPURL     string
 	WebhookURL  string
 	HTTPAddr    string
+	MetricsAddr string
 }
 
 func Load(requireWebhook bool) (Config, error) {
@@ -19,6 +20,7 @@ func Load(requireWebhook bool) (Config, error) {
 		AMQPURL:     strings.TrimSpace(os.Getenv("AMQP_URL")),
 		WebhookURL:  strings.TrimSpace(os.Getenv("WEBHOOK_URL")),
 		HTTPAddr:    strings.TrimSpace(os.Getenv("HTTP_ADDR")),
+		MetricsAddr: strings.TrimSpace(os.Getenv("METRICS_ADDR")),
 	}
 	if c.HTTPAddr == "" {
 		c.HTTPAddr = ":8080"

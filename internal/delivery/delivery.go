@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -26,6 +27,18 @@ func NewWebhook(url string) *Webhook {
 	}
 }
 
+type PermanentError struct {
+	Detail string
+}
+
+func (e *PermanentError) Error() string { return e.Detail }
+
+type TransientError struct {
+	Detail string
+}
+
+func (e *TransientError) Error() string { return e.Detail }
+
 type OutboundBody struct {
 	To       string          `json:"to"`
 	Channel  string          `json:"channel"`
@@ -34,7 +47,7 @@ type OutboundBody struct {
 	Priority string          `json:"priority"`
 }
 
-func (w *Webhook) Post(ctx context.Context, env amqp.Envelope) (string, error) {
+func (w *Webhook) Post(ctx context.Context, env amqp.Envelope) (messageID string, err error) {
 	body := OutboundBody{
 		To:       env.Recipient,
 		Channel:  env.Channel,
@@ -58,18 +71,34 @@ func (w *Webhook) Post(ctx context.Context, env amqp.Envelope) (string, error) {
 	}
 	res, err := w.Client.Do(req)
 	if err != nil {
-		return "", err
+		return "", &TransientError{Detail: err.Error()}
 	}
 	defer res.Body.Close()
 	respBody, _ := io.ReadAll(io.LimitReader(res.Body, 64<<10))
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return "", fmt.Errorf("webhook status %d: %s", res.StatusCode, string(respBody))
+	switch {
+	case res.StatusCode >= 200 && res.StatusCode < 300:
+		var parsed struct {
+			MessageID string `json:"messageId"`
+		}
+		if json.Unmarshal(respBody, &parsed) == nil && parsed.MessageID != "" {
+			return parsed.MessageID, nil
+		}
+		return "", nil
+	case res.StatusCode == http.StatusTooManyRequests:
+		return "", &TransientError{Detail: fmt.Sprintf("webhook status %d: %s", res.StatusCode, string(respBody))}
+	case res.StatusCode >= 400 && res.StatusCode < 500:
+		return "", &PermanentError{Detail: fmt.Sprintf("webhook status %d: %s", res.StatusCode, string(respBody))}
+	default:
+		return "", &TransientError{Detail: fmt.Sprintf("webhook status %d: %s", res.StatusCode, string(respBody))}
 	}
-	var parsed struct {
-		MessageID string `json:"messageId"`
-	}
-	if json.Unmarshal(respBody, &parsed) == nil && parsed.MessageID != "" {
-		return parsed.MessageID, nil
-	}
-	return "", nil
+}
+
+func IsPermanent(err error) bool {
+	var pe *PermanentError
+	return errors.As(err, &pe)
+}
+
+func IsTransient(err error) bool {
+	var te *TransientError
+	return errors.As(err, &te)
 }

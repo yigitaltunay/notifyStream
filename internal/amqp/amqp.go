@@ -17,7 +17,30 @@ const (
 	ExchangeDLX   = "notifications.dlx"
 	QueueDLQ      = "q.notify.dlq"
 	RoutingDLQ    = "notify.dlq"
+	HeaderRetry   = "x-retry-count"
 )
+
+func RetryCount(headers amqp091.Table) int {
+	if headers == nil {
+		return 0
+	}
+	v, ok := headers[HeaderRetry]
+	if !ok {
+		return 0
+	}
+	switch n := v.(type) {
+	case int32:
+		return int(n)
+	case int64:
+		return int(n)
+	case int:
+		return n
+	case byte:
+		return int(n)
+	default:
+		return 0
+	}
+}
 
 var queueByChannel = map[domain.Channel]string{
 	domain.ChannelSMS:   "q.notify.sms",
@@ -192,6 +215,30 @@ func (c *Client) PublishNotification(ctx context.Context, n domain.Notification)
 	}
 	if n.CorrelationID != nil && *n.CorrelationID != "" {
 		pub.Headers["correlation_id"] = *n.CorrelationID
+	}
+	return ch.PublishWithContext(ctx, ExchangeTopic, routingKey, false, false, pub)
+}
+
+func (c *Client) RepublishDelivery(ctx context.Context, routingKey string, body []byte, priority uint8, headers amqp091.Table) error {
+	c.mu.Lock()
+	ch := c.ch
+	c.mu.Unlock()
+	if ch == nil {
+		return fmt.Errorf("amqp republish: no channel")
+	}
+	h := amqp091.Table{}
+	for k, v := range headers {
+		h[k] = v
+	}
+	n := RetryCount(h) + 1
+	h[HeaderRetry] = int32(n)
+	pub := amqp091.Publishing{
+		ContentType:  "application/json",
+		DeliveryMode: amqp091.Persistent,
+		Priority:     priority,
+		Timestamp:    time.Now().UTC(),
+		Body:         body,
+		Headers:      h,
 	}
 	return ch.PublishWithContext(ctx, ExchangeTopic, routingKey, false, false, pub)
 }

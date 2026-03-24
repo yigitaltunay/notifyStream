@@ -131,13 +131,13 @@ func (s *Store) MarkSending(ctx context.Context, id uuid.UUID) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE notifications
 		SET status = 'sending', updated_at = now()
-		WHERE id = $1 AND status = 'queued'
+		WHERE id = $1 AND status IN ('queued', 'sending')
 	`, id)
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("notification %s not queued", id)
+		return fmt.Errorf("notification %s not queued or sending", id)
 	}
 	return nil
 }

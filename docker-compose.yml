@@ -60,6 +60,9 @@ services:
       DATABASE_URL: postgres://notify:notify@postgres:5432/notify?sslmode=disable
       AMQP_URL: amqp://guest:guest@rabbitmq:5672/
       WEBHOOK_URL: https://webhook.site/00000000-0000-0000-0000-000000000000
+      METRICS_ADDR: :9091
+    ports:
+      - "9091:9091"
 
 volumes:
   postgres_data:

@@ -118,6 +118,20 @@ paths:
       summary: Liveness
       tags:
       - health
+  /readyz:
+    get:
+      responses:
+        "200":
+          description: plain text
+          schema:
+            type: string
+        "503":
+          description: plain text
+          schema:
+            type: string
+      summary: Readiness (database + RabbitMQ)
+      tags:
+      - health
   /v1/batches/{batchId}/notifications:
     get:
       parameters:

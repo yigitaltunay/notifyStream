@@ -21,6 +21,7 @@ import (
 	"github.com/yaltunay/notifystream/internal/migrate"
 
 	_ "github.com/yaltunay/notifystream/docs"
+	_ "github.com/yaltunay/notifystream/internal/metrics"
 )
 
 func main() {

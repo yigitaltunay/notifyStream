@@ -408,6 +408,27 @@ func (h *Handler) CancelNotification(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toNotificationJSON(n, false))
 }
 
+// @Summary Readiness (database + RabbitMQ)
+// @Tags health
+// @Success 200 {string} string "plain text"
+// @Failure 503 {string} string "plain text"
+// @Router /readyz [get]
+func (h *Handler) Readyz(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	if err := h.store.Ping(ctx); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("database: unavailable\n"))
+		return
+	}
+	if err := h.bus.Ping(ctx); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("amqp: unavailable\n"))
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok\n"))
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)

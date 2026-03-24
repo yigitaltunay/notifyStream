@@ -31,6 +31,28 @@ const docTemplate = `{
                 }
             }
         },
+        "/readyz": {
+            "get": {
+                "tags": [
+                    "health"
+                ],
+                "summary": "Readiness (database + RabbitMQ)",
+                "responses": {
+                    "200": {
+                        "description": "plain text",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "503": {
+                        "description": "plain text",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
         "/v1/batches/{batchId}/notifications": {
             "get": {
                 "produces": [
