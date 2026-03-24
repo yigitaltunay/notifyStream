@@ -2,15 +2,15 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: notify
-      POSTGRES_PASSWORD: notify
-      POSTGRES_DB: notify
+      POSTGRES_USER: ${POSTGRES_USER:-notify}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-notify}
+      POSTGRES_DB: ${POSTGRES_DB:-notify}
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U notify -d notify"]
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -32,12 +32,8 @@ services:
     build: .
     image: notifystream:local
     command: ["/app/api"]
-    environment:
-      DATABASE_URL: postgres://notify:notify@postgres:5432/notify?sslmode=disable
-      AMQP_URL: amqp://guest:guest@rabbitmq:5672/
-      # Replace with your https://webhook.site/{uuid} for real delivery tests.
-      WEBHOOK_URL: https://webhook.site/00000000-0000-0000-0000-000000000000
-      HTTP_ADDR: :8080
+    env_file:
+      - .env
     ports:
       - "8080:8080"
     depends_on:
@@ -56,11 +52,8 @@ services:
         condition: service_healthy
       api:
         condition: service_started
-    environment:
-      DATABASE_URL: postgres://notify:notify@postgres:5432/notify?sslmode=disable
-      AMQP_URL: amqp://guest:guest@rabbitmq:5672/
-      WEBHOOK_URL: https://webhook.site/00000000-0000-0000-0000-000000000000
-      METRICS_ADDR: :9091
+    env_file:
+      - .env
     ports:
       - "9091:9091"
 

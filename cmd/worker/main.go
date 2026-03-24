@@ -78,7 +78,6 @@ func main() {
 
 	g, ctx := errgroup.WithContext(ctx)
 	for _, ch := range []domain.Channel{domain.ChannelSMS, domain.ChannelEmail, domain.ChannelPush} {
-		ch := ch
 		lim := limiters[ch]
 		g.Go(func() error {
 			slog.Info("consumer started", "channel", ch)
