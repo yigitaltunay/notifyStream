@@ -334,6 +334,39 @@ Both binaries use **`log/slog`** with JSON output. HTTP access logs include **`c
 
 If `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is set, the API wraps the router with `otelhttp` and the worker uses `otelhttp.NewTransport` for outbound calls, with trace propagation through AMQP headers as described above.
 
+Exporter implementation: **`otlptracehttp`** (`internal/tracing/tracing.go`) — use an **HTTP** OTLP endpoint (Jaeger’s OTLP HTTP listener is **4318**). **Do not open `http://localhost:4318/` in a browser** — that port is for the OTLP protocol only (you will often see `404 page not found`). The **Jaeger UI** is **[http://localhost:16686](http://localhost:16686)**.
+
+#### Local Jaeger (Docker Compose)
+
+1. **Docker Compose** injects `OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318` for `api`, `worker`, and `scheduler` when the variable is unset, so **`notifystream-api` appears in Jaeger after traffic** without editing `.env`. To run **without** tracing, put `OTEL_EXPORTER_OTLP_ENDPOINT=` (empty) in `.env`, or remove the `OTEL_EXPORTER_OTLP_ENDPOINT` lines under `environment` in [`docker-compose.yml`](docker-compose.yml). For **host-run** binaries (`go run`), set the same variable in [`.env`](.env.example) (e.g. `http://127.0.0.1:4318` if Jaeger listens on the host).
+
+2. Start the stack (Jaeger is included by default):
+
+   ```bash
+   docker compose up --build
+   ```
+
+3. Open **Jaeger UI**: [http://localhost:16686](http://localhost:16686) → **Search** (path **`/search`**). **`/trace` alone is not the search page** — it is used with a trace ID (`/trace/<id>`) after you open a trace from search results.
+
+4. Generate traffic (e.g. `POST /v1/notifications`) and refresh the UI; you should see spans linked across API → (optional publish span context) → worker → webhook HTTP.
+
+5. To see the HTTP path the API handled, open a span in the trace timeline and check **Tags** for attributes such as **`http.target`**, **`http.route`** (when available), or **`url.full`**.
+
+**Reading the Search results:** Traces whose service is **`jaeger-all-in-one`** with **`http.target=/api/traces`** come from the **Jaeger UI** calling its own query API on port **16686** — not from NotifyStream. For Swagger or `curl` against **`localhost:8080`**, set **Service** to **`notifystream-api`**, then **Find Traces** (you can narrow by operation or tags if the UI offers it).
+
+**If the UI does not load:** Jaeger only runs when its container is up. Run `docker compose up -d` (or recreate after pulling the image), then `docker ps` and confirm a container is listening on **16686**. Another process using port 16686 will prevent the UI from starting.
+
+#### Jaeger without Compose (one container)
+
+```bash
+docker run -d --name jaeger \
+  -p 16686:16686 -p 4318:4318 \
+  -e COLLECTOR_OTLP_ENABLED=true \
+  jaegertracing/all-in-one:1.57
+```
+
+Then point processes on the host at `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318`. If the API/worker run **inside** Compose but Jaeger runs on the host, use `http://host.docker.internal:4318` (Docker Desktop) instead of `127.0.0.1`.
+
 ---
 
 ## Configuration
@@ -345,7 +378,8 @@ If `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is set,
 | `WEBHOOK_URL` | worker: yes | — | Full URL of the external notification provider. |
 | `HTTP_ADDR` | no | `:8080` | API listen address. |
 | `METRICS_ADDR` | no | empty | If set (e.g. `:9091`), worker serves `GET /metrics`. |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | no | — | OTLP endpoint for traces (see OpenTelemetry docs for format). |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | no | — | OTLP endpoint for traces (HTTP), e.g. `http://jaeger:4318` when using Docker Compose (Jaeger service). |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | no | — | Alternative to the above; full traces URL if your collector requires it. |
 | `OTEL_SERVICE_NAME` | no | — | Standard OTel resource attribute (also influenced by `resource.WithFromEnv()`). |
 
 Copy `.env.example` to `.env` for Docker Compose.
@@ -364,6 +398,7 @@ docker compose up --build
 - **Swagger UI**: `http://localhost:8080/swagger/index.html`
 - **RabbitMQ management**: `http://localhost:15672` (`guest` / `guest`)
 - **Worker metrics** (if `METRICS_ADDR=:9091` in `.env`): `http://localhost:9091/metrics`
+- **Jaeger**: UI [http://localhost:16686](http://localhost:16686), OTLP HTTP port **4318** (set `OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318` in `.env` to export traces)
 
 The **scheduler** and **worker** services wait for the API container to **start** so migrations can run first. Run **one** scheduler task in production unless you add coordination for multiple schedulers.
 

@@ -2,6 +2,8 @@ package tracing
 
 import (
 	"context"
+	"fmt"
+	"net/url"
 	"os"
 	"strings"
 
@@ -32,7 +34,31 @@ func Setup(ctx context.Context, serviceName string) (func(context.Context) error
 		return func(context.Context) error { return nil }, nil
 	}
 
-	exp, err := otlptracehttp.New(ctx)
+	u, err := url.Parse(ep)
+	if err != nil {
+		return nil, fmt.Errorf("tracing: parse OTLP endpoint: %w", err)
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("tracing: OTLP endpoint %q must include host (e.g. http://jaeger:4318)", ep)
+	}
+
+	var expOpts []otlptracehttp.Option
+	p := strings.TrimSuffix(strings.TrimSpace(u.Path), "/")
+	if p == "" {
+		expOpts = append(expOpts, otlptracehttp.WithEndpoint(u.Host))
+	} else {
+		expOpts = append(expOpts, otlptracehttp.WithEndpointURL(strings.TrimRight(ep, "/")))
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+		expOpts = append(expOpts, otlptracehttp.WithInsecure())
+	case "https":
+		// TLS via system roots
+	default:
+		return nil, fmt.Errorf("tracing: OTLP endpoint URL scheme must be http or https, got %q", u.Scheme)
+	}
+
+	exp, err := otlptracehttp.New(ctx, expOpts...)
 	if err != nil {
 		return nil, err
 	}

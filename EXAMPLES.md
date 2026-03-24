@@ -458,6 +458,19 @@ You will also see standard runtime metrics (names vary by Go/client version), fo
 
 These help monitor **memory and CPU** of each process independently of notification business logic.
 
+### Distributed tracing (OpenTelemetry)
+
+Tracing is **off** until you set `OTEL_EXPORTER_OTLP_ENDPOINT` (or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`) to an **OTLP HTTP** collector. The app uses `notifystream-api`, `notifystream-worker`, and `notifystream-scheduler` as service names and propagates context over **RabbitMQ** message headers.
+
+**Quick local setup:** enable Jaeger with Compose and `.env` as documented in the README — [Local Jaeger (Docker Compose)](README.md#local-jaeger-docker-compose). One-liner without Compose:
+
+```bash
+docker run -d --name jaeger -p 16686:16686 -p 4318:4318 \
+  -e COLLECTOR_OTLP_ENABLED=true jaegertracing/all-in-one:1.57
+```
+
+Then export `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318` for processes on the host and open the UI at [http://localhost:16686](http://localhost:16686). Port **4318** is only for OTLP HTTP ingestion; visiting `http://localhost:4318/` in a browser usually returns **404** — that is expected.
+
 ---
 
 ## WebSocket status stream
