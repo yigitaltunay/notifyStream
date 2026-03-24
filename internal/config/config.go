@@ -1,0 +1,44 @@
+package config
+
+import (
+	"fmt"
+	"os"
+	"strings"
+)
+
+// Config holds runtime settings loaded from the environment.
+type Config struct {
+	DatabaseURL string
+	AMQPURL     string
+	WebhookURL  string
+	HTTPAddr    string
+}
+
+// Load reads required configuration from the environment.
+// HTTPAddr defaults to ":8080" when unset (API only).
+func Load() (Config, error) {
+	c := Config{
+		DatabaseURL: strings.TrimSpace(os.Getenv("DATABASE_URL")),
+		AMQPURL:     strings.TrimSpace(os.Getenv("AMQP_URL")),
+		WebhookURL:  strings.TrimSpace(os.Getenv("WEBHOOK_URL")),
+		HTTPAddr:    strings.TrimSpace(os.Getenv("HTTP_ADDR")),
+	}
+	if c.HTTPAddr == "" {
+		c.HTTPAddr = ":8080"
+	}
+
+	var missing []string
+	if c.DatabaseURL == "" {
+		missing = append(missing, "DATABASE_URL")
+	}
+	if c.AMQPURL == "" {
+		missing = append(missing, "AMQP_URL")
+	}
+	if c.WebhookURL == "" {
+		missing = append(missing, "WEBHOOK_URL")
+	}
+	if len(missing) > 0 {
+		return Config{}, fmt.Errorf("missing required environment variables: %s", strings.Join(missing, ", "))
+	}
+	return c, nil
+}

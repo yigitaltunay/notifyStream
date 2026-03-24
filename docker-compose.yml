@@ -1,0 +1,66 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: notify
+      POSTGRES_PASSWORD: notify
+      POSTGRES_DB: notify
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notify -d notify"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    image: notifystream:local
+    command: ["/app/api"]
+    environment:
+      DATABASE_URL: postgres://notify:notify@postgres:5432/notify?sslmode=disable
+      AMQP_URL: amqp://guest:guest@rabbitmq:5672/
+      # Replace with your https://webhook.site/{uuid} for real delivery tests.
+      WEBHOOK_URL: https://webhook.site/00000000-0000-0000-0000-000000000000
+      HTTP_ADDR: :8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  worker:
+    image: notifystream:local
+    command: ["/app/worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      api:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgres://notify:notify@postgres:5432/notify?sslmode=disable
+      AMQP_URL: amqp://guest:guest@rabbitmq:5672/
+      WEBHOOK_URL: https://webhook.site/00000000-0000-0000-0000-000000000000
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
