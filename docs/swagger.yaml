@@ -1,0 +1,276 @@
+basePath: /
+definitions:
+  internal_api.BatchNotificationsResponse:
+    properties:
+      notifications:
+        items:
+          $ref: '#/definitions/internal_api.NotificationResponse'
+        type: array
+    type: object
+  internal_api.CreateNotificationItem:
+    properties:
+      channel:
+        type: string
+      content:
+        type: string
+      idempotency_key:
+        type: string
+      payload:
+        items:
+          type: integer
+        type: array
+      priority:
+        type: string
+      recipient:
+        type: string
+      scheduled_at:
+        type: string
+      template_id:
+        type: string
+    type: object
+  internal_api.CreateNotificationsRequest:
+    properties:
+      batch_metadata:
+        items:
+          type: integer
+        type: array
+      notifications:
+        items:
+          $ref: '#/definitions/internal_api.CreateNotificationItem'
+        type: array
+    type: object
+  internal_api.CreateNotificationsResponse:
+    properties:
+      batch_id:
+        type: string
+      idempotent_hits:
+        type: integer
+      notifications:
+        items:
+          $ref: '#/definitions/internal_api.NotificationResponse'
+        type: array
+    type: object
+  internal_api.ErrorResponse:
+    properties:
+      error:
+        type: string
+    type: object
+  internal_api.NotificationListResponse:
+    properties:
+      next_cursor:
+        type: string
+      notifications:
+        items:
+          $ref: '#/definitions/internal_api.NotificationResponse'
+        type: array
+    type: object
+  internal_api.NotificationResponse:
+    properties:
+      batch_id:
+        type: string
+      channel:
+        type: string
+      content:
+        type: string
+      correlation_id:
+        type: string
+      created_at:
+        type: string
+      id:
+        type: string
+      idempotency_key:
+        type: string
+      inserted:
+        type: boolean
+      payload:
+        items:
+          type: integer
+        type: array
+      priority:
+        type: string
+      provider_message_id:
+        type: string
+      recipient:
+        type: string
+      scheduled_at:
+        type: string
+      status:
+        type: string
+      template_id:
+        type: string
+      updated_at:
+        type: string
+    type: object
+host: localhost:8080
+info:
+  contact: {}
+  description: Notifications HTTP API (PostgreSQL + RabbitMQ).
+  title: NotifyStream API
+  version: "1.0"
+paths:
+  /healthz:
+    get:
+      responses:
+        "200":
+          description: plain text
+          schema:
+            type: string
+      summary: Liveness
+      tags:
+      - health
+  /v1/batches/{batchId}/notifications:
+    get:
+      parameters:
+      - description: Batch ID (UUID)
+        in: path
+        name: batchId
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/internal_api.BatchNotificationsResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/internal_api.ErrorResponse'
+      summary: List batch notifications
+      tags:
+      - batches
+  /v1/notifications:
+    get:
+      parameters:
+      - description: Status
+        enum:
+        - pending
+        - queued
+        - sending
+        - delivered
+        - failed
+        - cancelled
+        in: query
+        name: status
+        type: string
+      - description: Channel
+        enum:
+        - sms
+        - email
+        - push
+        in: query
+        name: channel
+        type: string
+      - description: RFC3339
+        in: query
+        name: from
+        type: string
+      - description: RFC3339
+        in: query
+        name: to
+        type: string
+      - default: 20
+        description: 1-100
+        in: query
+        name: limit
+        type: integer
+      - description: Pagination cursor
+        in: query
+        name: cursor
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/internal_api.NotificationListResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/internal_api.ErrorResponse'
+      summary: List notifications
+      tags:
+      - notifications
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: Correlation ID
+        in: header
+        name: X-Request-ID
+        type: string
+      - description: Body
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/internal_api.CreateNotificationsRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/internal_api.CreateNotificationsResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/internal_api.ErrorResponse'
+      summary: Create notifications
+      tags:
+      - notifications
+  /v1/notifications/{id}:
+    get:
+      parameters:
+      - description: Notification ID (UUID)
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/internal_api.NotificationResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/internal_api.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/internal_api.ErrorResponse'
+      summary: Get notification
+      tags:
+      - notifications
+  /v1/notifications/{id}/cancel:
+    post:
+      parameters:
+      - description: Notification ID (UUID)
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/internal_api.NotificationResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/internal_api.ErrorResponse'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/internal_api.ErrorResponse'
+      summary: Cancel notification
+      tags:
+      - notifications
+swagger: "2.0"

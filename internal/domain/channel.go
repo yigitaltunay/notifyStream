@@ -1,6 +1,5 @@
 package domain
 
-// Channel identifies a notification delivery channel.
 type Channel string
 
 const (
